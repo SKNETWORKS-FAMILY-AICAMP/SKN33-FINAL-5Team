@@ -1,0 +1,538 @@
+"""Native inspection -> primary parse -> bounded supplemental routes -> merge.
+
+No engine confidence is treated as document accuracy. Native values are never
+overwritten by OCR, and conflicting parser candidates remain reviewable.
+"""
+import json
+import math
+import os
+import re
+import time
+from pathlib import Path
+from . import CONTRACT_VERSION
+from .adapters import LocalEngines, convert
+from .contracts import AnalysisError, FORMATS, IMAGE_FORMATS, MAX_BYTES, block, bounds, project, sha256, validate
+from .readers import Inspector
+from .image_metadata import png_resolution
+
+PRIMARY = {'pdf': 'mineru', 'hwp': 'docling', 'hwpx': 'docling', 'doc': 'docling',
+           'docx': 'docling', 'ppt': 'docling', 'pptx': 'docling', 'xls': 'native', 'xlsx': 'native',
+           'csv': 'native', 'tsv': 'native', 'txt': 'native', 'md': 'native',
+           **{fmt: 'layout' for fmt in IMAGE_FORMATS}}
+# Text crops of small photos are enlarged before OCR. A 567x1140 receipt photo gave ~15px text lines;
+# the mobile detector merged them and the item lines came back as noise, while the same crop at 2x read correctly.
+OCR_UPSCALE_BELOW = 1500
+OCR_MAX_SCALE = 3
+
+
+def ocr_scale(size):
+    """Integer enlargement for text crops of an image whose long side is below OCR_UPSCALE_BELOW."""
+    long_side = max(size)
+    return 1 if long_side >= OCR_UPSCALE_BELOW else min(OCR_MAX_SCALE, -(-OCR_UPSCALE_BELOW // long_side))
+
+
+def uncovered_ink_bands(picture, regions):
+    """Find substantial horizontal strips which contain detail but were never sent to an engine."""
+    from PIL import ImageChops
+
+    width, height = picture.size
+    cursor = 0
+    bands = []
+    intervals = sorted((int(r['bbox']['values'][1]), int(r['bbox']['values'][3]) + 1) for r in regions)
+    for top, bottom in [*intervals, (height, height)]:
+        top = min(height, max(0, top))
+        if top - cursor >= max(18, height * .10):
+            sample = picture.crop((0, cursor, width, top)).convert('L')
+            sample.thumbnail((384, 192))
+            # Horizontal contrast along several scan lines filters out blank margins and gradients.
+            shifts = ImageChops.difference(sample, ImageChops.offset(sample, 1, 0))
+            ink = shifts.point(lambda v: int(v >= 32)).tobytes()
+            w = sample.width
+            detailed_rows = sum(sum(ink[row + 1:row + w]) >= max(5, w // 30) for row in range(0, len(ink), w))
+            if detailed_rows >= 3:
+                bands.append((cursor, top))
+        cursor = min(height, max(cursor, bottom))
+    return bands
+
+
+def valid_ocr_box(box):
+    return (isinstance(box, (tuple, list)) and len(box) == 4
+            and all(isinstance(value, (int, float)) and math.isfinite(value) for value in box)
+            and box[0] < box[2] and box[1] < box[3])
+
+
+def ocr_in_bands(result, bands, scale):
+    """Keep newly located pieces; only legible, scored pieces establish coverage."""
+    texts = result.get('rec_texts') or []
+    boxes = result.get('rec_boxes') or []
+    scores = result.get('rec_scores') or []
+    selected = {'rec_texts': [], 'rec_boxes': [], 'rec_scores': []}
+    if len(texts) != len(boxes):
+        return selected, bands
+    scored = len(scores) == len(texts)
+    centers = []
+    for i, (text, box) in enumerate(zip(texts, boxes)):
+        if not valid_ocr_box(box):
+            continue
+        center = (box[1] + box[3]) / (2 * scale)
+        if not any(top <= center < bottom for top, bottom in bands):
+            continue
+        selected['rec_texts'].append(text)
+        selected['rec_boxes'].append(box)
+        if scored:
+            score = scores[i]
+            selected['rec_scores'].append(score)
+            if text.strip() and isinstance(score, (int, float)) and .6 <= score <= 1:
+                centers.append(center)
+    unread = [(top, bottom) for top, bottom in bands if not any(top <= y < bottom for y in centers)]
+    return selected, unread
+
+
+def ocr_text(result):
+    """Join OCR pieces into visual lines using their boxes.
+
+    PaddleOCR returns pieces in detection order, so a receipt row "마늘빅프랑크  1  2,100" came back as
+    separate lines and quantities drifted next to other items. Pieces whose vertical spans overlap by at
+    least half of the shorter piece form one line, ordered left to right. Without usable boxes the
+    detection order is kept.
+    """
+    texts, boxes = result.get('rec_texts', []), result.get('rec_boxes')
+    if not boxes or len(boxes) != len(texts) or not all(valid_ocr_box(box) for box in boxes):
+        return '\n'.join(texts)
+    pieces = sorted(((float(b[1]), float(b[3]), float(b[0]), t) for t, b in zip(texts, boxes) if t.strip()),
+                    key=lambda p: (p[0] + p[1]) / 2)
+    lines = []
+    for top, bottom, left, text in pieces:
+        line = lines[-1] if lines else None
+        # The band stays that of the line's first piece; widening it would chain adjacent rows on a skewed photo.
+        if line and min(bottom, line['bottom']) - max(top, line['top']) >= .5 * min(bottom - top, line['bottom'] - line['top']):
+            line['pieces'].append((left, text))
+        else:
+            lines.append(dict(top=top, bottom=bottom, pieces=[(left, text)]))
+    return '\n'.join(' '.join(t for _, t in sorted(line['pieces'])) for line in lines)
+
+
+def canonical_kind(kind):
+    if kind in {'table', 'table_body'}:
+        return 'table'
+    if kind in {'image', 'picture', 'figure'}:
+        return 'image'
+    if kind in {'chart', 'formula'}:
+        return kind
+    if kind in {'unknown', 'abandoned'}:
+        return 'unknown'
+    return 'text'
+
+
+def run(source, work, *, engines=None, converter=convert, max_supplements=16, pdf_primary='mineru'):
+    source, work = Path(source).resolve(), Path(work).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    fmt = source.suffix[1:].lower()
+    if fmt not in FORMATS:
+        raise AnalysisError('unsupported_format', '지원하지 않는 문서 형식입니다.')
+    if not source.is_file() or not 0 < source.stat().st_size <= MAX_BYTES:
+        raise AnalysisError('input_limit', '문서는 0바이트 초과·8MB 이하로 연결하세요.')
+    if not 0 <= max_supplements <= 32:
+        raise AnalysisError('invalid_configuration', '보완 처리 상한은 0~32여야 합니다.')
+    engines = engines or LocalEngines(work)
+    if pdf_primary not in ('mineru', 'docling'):
+        raise AnalysisError('invalid_configuration', 'PDF 엔진은 mineru 또는 docling이어야 합니다.')
+    primary = pdf_primary if fmt == 'pdf' else PRIMARY[fmt]
+    result = dict(contract_version=CONTRACT_VERSION, document_id=sha256(source), source_sha256=sha256(source),
+                  source_format=fmt, primary_processor=primary, blocks=[], units=[], routes=engines.attempts,
+                  warnings=[], review_required=False, review_reasons=[], conversions=[], signals=[],
+                  status='succeeded', routing_decisions=[dict(phase='primary', rule='source_format_default',
+                  processor=primary, source_format=fmt)], policy=dict(max_supplements=max_supplements, scan_characters=30,
+                  broken_ratio=.05, scan_image_fraction=.6, detection_threshold=.5, thresholds_are_provisional=True,
+                  ocr_upscale_below=OCR_UPSCALE_BELOW, ocr_max_scale=OCR_MAX_SCALE))
+    def review(reason):
+        if reason not in result['warnings']:
+            result['warnings'].append(reason)
+        if reason not in result['review_reasons']:
+            result['review_reasons'].append(reason)
+        result['review_required'] = True
+
+    effective, effective_fmt = source, fmt
+    if fmt in {'hwp', 'hwpx', 'doc', 'ppt', 'xls'}:
+        conversion_start = time.perf_counter()
+        effective, effective_fmt, record = converter(source, fmt, work)
+        result['conversions'].append({**record, 'elapsed_seconds': time.perf_counter() - conversion_start})
+        review('converted_source_requires_preservation_check')
+    inspection_start = time.perf_counter()
+    inspector = Inspector(effective, work)
+    try:
+        inspected = inspector.run(effective_fmt)
+    except AnalysisError as exc:
+        # Native PDF inspection is mandatory: geometry and page coverage cannot be invented.
+        if effective_fmt == 'pdf' or exc.code != 'dependency_missing':
+            raise
+        inspected = dict(units=[], blocks=[], images=[], warnings=[exc.code], signals=[])
+    result.update(blocks=inspected['blocks'], units=inspected['units'], signals=inspected['signals'])
+    for warning in inspected['warnings']:
+        review(warning)
+    result['timings'] = dict(inspection_seconds=time.perf_counter() - inspection_start)
+    primary_failed = False
+
+    def add_parsed(parsed, *, parent=None, unit=None, location=None, selected=True, phase='primary'):
+        added = []
+        for entry in parsed.get('blocks', []):
+            original_location = entry.get('location', {})
+            page = original_location.get('page')
+            loc = location or original_location
+            native_unit = unit or ('page-' + str(page) if effective_fmt == 'pdf' and page else
+                                   result['units'][0]['id'] if result['units'] else 'document')
+            if effective_fmt != 'pdf' and page and not location:
+                loc = {'parser_object_index': len(added), 'parser_reported_page': page}
+            geometry = entry.get('bbox')
+            item = block('parsed-' + str(len(result['blocks']) + 1), canonical_kind(entry['kind']), loc,
+                         text=entry.get('text', ''), data=entry.get('data', {}), parent=parent, unit=native_unit,
+                         engine=parsed['engine'], bbox=bounds(geometry, entry.get('coordinate_system', 'engine_native')) if geometry else None)
+            item.update(selected=selected, parser_version=parsed['version'], phase=phase)
+            result['blocks'].append(item)
+            added.append(item)
+        if parsed.get('partial'):
+            review('partial_engine_output:' + parsed['engine'])
+        return added
+
+    if result['primary_processor'] in {'mineru', 'docling'}:
+        try:
+            parsed = engines.run(result['primary_processor'], source=effective, scope='document')
+            # Office's original paragraphs/cells remain authoritative; Docling is a separate candidate.
+            add_parsed(parsed, selected=effective_fmt == 'pdf')
+        except AnalysisError as exc:
+            primary_failed = True
+            review('primary_' + result['primary_processor'] + ':' + exc.code)
+            if result['primary_processor'] == 'mineru':
+                result['routing_decisions'].append(dict(phase='fallback', rule='primary_engine_failed', processor='docling'))
+                try:
+                    parsed = engines.run('docling', source=effective, scope='document', phase='fallback')
+                    add_parsed(parsed)
+                    result['fallback_processor'] = 'docling'
+                    primary_failed = False
+                except AnalysisError as fallback_error:
+                    review('fallback_docling:' + fallback_error.code)
+            if primary_failed:
+                for item in result['blocks']:
+                    if item['text'].strip():
+                        item['selected'] = True
+                result['fallback_processor'] = 'native'
+
+    # Reuse parsed figure boxes to inspect only those PDF images lacking overlapping text.
+    images = inspected['images']
+    if effective_fmt == 'pdf' and not primary_failed:
+        try:
+            import pymupdf as fitz
+        except ImportError:
+            import fitz
+        with fitz.open(effective) as pdf:
+            candidates = [b for b in list(result['blocks']) if b['engine'] != 'pymupdf' and 'image' in b['content_types'] and b.get('bbox')]
+            for item in candidates:
+                page_no = item['native_location'].get('page')
+                if not page_no or page_no > len(pdf):
+                    review('figure_source_page_unknown')
+                    continue
+                geometry = item['bbox']
+                coords = geometry['values']
+                page = pdf[page_no - 1]
+                if geometry['coordinate_system'] == 'mineru_normalized_top_left':
+                    coords = [coords[0]*page.rect.width, coords[1]*page.rect.height,
+                              coords[2]*page.rect.width, coords[3]*page.rect.height]
+                elif geometry['coordinate_system'] != 'pdf_top_left_points':
+                    review('figure_coordinate_system_unknown')
+                    continue
+                rect = fitz.Rect(coords) & page.rect
+                if rect.is_empty:
+                    continue
+                overlaps = False
+                for other in result['blocks']:
+                    if not other.get('selected', True) or not other['text'].strip() or other['native_location'].get('page') != page_no or not other.get('bbox'):
+                        continue
+                    box = other['bbox']
+                    values = box['values']
+                    if box['coordinate_system'] == 'mineru_normalized_top_left':
+                        values = [values[0]*page.rect.width, values[1]*page.rect.height, values[2]*page.rect.width, values[3]*page.rect.height]
+                    elif box['coordinate_system'] != 'pdf_top_left_points':
+                        continue
+                    region = fitz.Rect(values)
+                    if region.get_area() and (region & rect).get_area() / region.get_area() > .8:
+                        overlaps = True
+                        break
+                if overlaps:
+                    item['data']['existing_text_reused'] = True
+                    continue
+                if len(images) >= max_supplements:
+                    review('supplement_limit_reached')
+                    continue
+                scale = min(1.5, (4000000 / max(rect.get_area(), 1))**.5)
+                path = work / f'figure-{len(images) + 1}.png'
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=rect, alpha=False)
+                dpi = max(1, round(72 * scale))
+                pixmap.set_dpi(dpi, dpi)
+                pixmap.save(path)
+                item['artifact'] = str(path.relative_to(work))
+                item['data']['raster_transform'] = dict(pdf_rect=list(rect), pixels_per_point=scale, raster_dpi=[dpi, dpi])
+                images.append(dict(block_id=item['id'], path=path))
+
+    # Bound engine work, explicitly retaining skipped source objects.
+    if len(images) > max_supplements:
+        review('supplement_limit_reached')
+    targets = images[:max_supplements]
+    by_id = {b['id']: b for b in result['blocks']}
+    jobs = []
+    for image in targets:
+        parent = by_id[image['block_id']]
+        try:
+            from PIL import Image, ImageOps
+            with Image.open(image['path']) as original:
+                orientation = original.getexif().get(274, 1)
+                resolution = png_resolution(original, orientation)
+                normalized = ImageOps.exif_transpose(original).convert('RGB')
+                path = work / ('upright-' + parent['id'] + '.png')
+                normalized.save(path, **resolution)
+                parent['data']['image_transform'] = dict(original_size=list(original.size), upright_size=list(normalized.size),
+                                                        exif_orientation=orientation, upright_dpi=resolution.get('dpi'))
+                jobs.append(dict(parent=parent, path=path, size=normalized.size))
+        except (ImportError, OSError, ValueError) as exc:
+            parent['status'] = 'review_required'
+            review('image_decode_or_dependency_error:' + type(exc).__name__)
+    ocr_jobs = []
+    table_jobs = []
+    classified_count = 0
+    if jobs:
+        try:
+            detected = engines.run('layout', sources=[j['path'] for j in jobs], scope=[j['parent']['id'] for j in jobs], phase='classification')
+            mapped = {str(j['path']): j for j in jobs}
+            seen = set()
+            for prediction in detected['outputs']:
+                job = mapped[prediction['source']]
+                seen.add(prediction['source'])
+                parent = job['parent']
+                for detection in prediction['result'].get('boxes', []):
+                    score = float(detection['score'])
+                    if not 0 <= score <= 1 or score < result['policy']['detection_threshold']:
+                        review('low_confidence_region')
+                        continue
+                    kind = canonical_kind(detection['label'])
+                    coords = detection['coordinate']
+                    region = block('region-' + str(len(result['blocks']) + 1), kind, parent['native_location'],
+                                   parent=parent['id'], unit=parent['unit_id'], engine='layout',
+                                   bbox=bounds(coords, 'upright_image_pixels', width=job['size'][0], height=job['size'][1]))
+                    region.update(detection_score=score, detector_model=detected['model'], parser_version=detected['version'])
+                    result['blocks'].append(region)
+                    result['routing_decisions'].append(dict(phase='supplement', scope=region['id'],
+                        rule='detected_region_type', content_type=kind,
+                        processor='paddleocr' if kind == 'text' else 'docling' if kind == 'table' else 'preserve_or_review'))
+                    if kind in {'text', 'table'}:
+                        if len(ocr_jobs) + len(table_jobs) >= max_supplements:
+                            region['status'] = 'review_required'
+                            review('supplement_limit_reached')
+                            continue
+                        x0, y0, x1, y1 = coords
+                        crop_bounds = (max(0, int(x0)), max(0, int(y0)), min(job['size'][0], int(x1 + 1)), min(job['size'][1], int(y1 + 1)))
+                        if crop_bounds[0] >= crop_bounds[2] or crop_bounds[1] >= crop_bounds[3]:
+                            region['status'] = 'review_required'
+                            review('invalid_region_crop')
+                            continue
+                        crop_path = work / ('crop-' + region['id'] + '.png')
+                        # Tables keep source pixels for Docling; only OCR input is enlarged.
+                        scale = ocr_scale(job['size']) if kind == 'text' else 1
+                        with Image.open(job['path']) as picture:
+                            resolution = png_resolution(picture)
+                            cropped = picture.crop(crop_bounds)
+                            if scale > 1:
+                                cropped = cropped.resize((cropped.width * scale, cropped.height * scale), Image.LANCZOS)
+                                if resolution:
+                                    resolution = {'dpi': tuple(v * scale for v in resolution['dpi'])}
+                            cropped.save(crop_path, **resolution)
+                        region['artifact'] = str(crop_path.relative_to(work))
+                        region['data']['crop_origin'] = list(crop_bounds[:2])
+                        region['data']['crop_dpi'] = resolution.get('dpi')
+                        # OCR coordinates inside the crop are divided by this to return to upright pixels.
+                        region['data']['crop_scale'] = scale
+                        (ocr_jobs if kind == 'text' else table_jobs).append(dict(path=crop_path, parent=region, context=job,
+                                                                                 origin=list(crop_bounds[:2]), scale=scale))
+                    elif kind in {'formula', 'chart', 'unknown'}:
+                        region['status'] = 'review_required'
+                        review('semantic_analysis_required:' + kind)
+            if len(seen) != len(jobs):
+                review('missing_image_classification_output')
+            classified_count = len(seen)
+        except AnalysisError as exc:
+            review('image_classification:' + exc.code)
+            for job in jobs:
+                job['parent']['status'] = 'review_required'
+        layout_failed = classified_count == 0
+
+        # An image with no usable text/table region would otherwise yield no text at all.
+        # Receipt regions scored 0.51-0.54 against the 0.5 threshold, so a slightly worse photo
+        # could drop every region; the whole upright image is OCR'd once instead.
+        covered = {}
+        for part in ocr_jobs + table_jobs:
+            covered.setdefault(part['context']['parent']['id'], []).append(part['parent'])
+        for job in jobs:
+            parent = job['parent']
+            regions = covered.get(parent['id'], [])
+            if regions and fmt not in IMAGE_FORMATS:
+                continue  # Embedded figures and tabular documents have separate coverage policies.
+            scale = ocr_scale(job['size'])
+            path = work / ('ocr-' + parent['id'] + '.png')
+            with Image.open(job['path']) as picture:
+                bands = uncovered_ink_bands(picture, regions) if regions else []
+                if regions and not bands:
+                    continue
+                if len(ocr_jobs) + len(table_jobs) >= max_supplements:
+                    review('supplement_limit_reached')
+                    break
+                resolution = png_resolution(picture)
+                # Recognize with the full page context (masking may fuse adjacent numeric
+                # columns). Select only new lines by their coordinates after recognition.
+                whole = picture.copy()
+                if scale > 1:
+                    whole = whole.resize((picture.width * scale, picture.height * scale), Image.LANCZOS)
+                if scale > 1 and resolution:
+                    resolution = {'dpi': tuple(v * scale for v in resolution['dpi'])}
+                whole.save(path, **resolution)
+            rule = 'uncovered_image_bands' if bands else 'layout_unavailable' if layout_failed else 'no_text_region_detected'
+            decision = dict(phase='supplement', scope=parent['id'], rule=rule, processor='paddleocr')
+            if bands:
+                decision['upright_y_bands'] = bands
+            else:
+                review('whole_image_ocr_fallback:' + rule)
+            result['routing_decisions'].append(decision)
+            ocr_jobs.append(dict(path=path, parent=parent, context=job, origin=[0, 0], scale=scale, bands=bands))
+
+    if ocr_jobs:
+        try:
+            recognized = engines.run('paddleocr', sources=[j['path'] for j in ocr_jobs],
+                                     scope=[j['parent']['id'] for j in ocr_jobs], phase='supplement')
+            mapped = {str(j['path']): j for j in ocr_jobs}
+            seen = set()
+            for output in recognized['outputs']:
+                job = mapped[output['source']]
+                seen.add(output['source'])
+                region = job['parent']
+                prediction = output['result']
+                bands = job.get('bands') or []
+                if bands:
+                    prediction, unread = ocr_in_bands(prediction, bands, job['scale'])
+                text = ocr_text(prediction)
+                item = block('ocr-' + str(len(result['blocks']) + 1), 'text', region['native_location'],
+                             parent=region['id'], unit=region['unit_id'], text=text, engine='paddleocr',
+                             data={'ocr_scores': prediction.get('rec_scores', []), 'crop_origin': job['origin'],
+                                   'crop_scale': job['scale']})
+                item['parser_version'] = recognized['version']
+                if bands:
+                    item['data']['upright_y_bands'] = bands
+                    if unread:
+                        item['data']['unverified_y_bands'] = unread
+                        review('low_confidence_uncovered_ocr:' + region['id'])
+                result['blocks'].append(item)
+                if not text.strip():
+                    review('empty_ocr_region:' + region['id'])
+            if len(seen) != len(ocr_jobs):
+                review('missing_ocr_output')
+        except AnalysisError as exc:
+            review('image_ocr:' + exc.code)
+
+    missing_table_images = {}
+    for job in table_jobs:
+        region = job['parent']
+        try:
+            parsed = engines.run('docling', source=job['path'], scope=region['id'], phase='supplement')
+            added = add_parsed(parsed, parent=region['id'], unit=region['unit_id'], location=region['native_location'], phase='supplement')
+            for item in added:
+                item['data']['crop_origin'] = region['data']['crop_origin']
+                item['data']['input_coordinate_system'] = 'crop_pixels_or_engine_page'
+                # A crop-local engine box must not masquerade as original PDF geometry.
+                if item['bbox']:
+                    item['bbox']['coordinate_system'] = 'docling_crop_input_points'
+            if not any('table' in b['content_types'] and b['data'].get('cells') for b in added):
+                review('table_structure_missing:' + region['id'])
+                context = job['context']
+                entry = missing_table_images.setdefault(context['parent']['id'], dict(context=context, regions=[]))
+                entry['regions'].append(region['id'])
+        except AnalysisError as exc:
+            review('image_table:' + exc.code)
+
+    # Tight crops can remove layout context. Compare the containing image once,
+    # retaining the original crop output and exposing the result as a candidate.
+    for image_id, entry in missing_table_images.items():
+        if len(ocr_jobs) + len(table_jobs) >= max_supplements:
+            review('supplement_limit_reached')
+            break
+        table_jobs.append({'comparison_image': image_id})
+        context = entry['context']
+        image = context['parent']
+        result['routing_decisions'].append(dict(phase='comparison', rule='missing_crop_table_structure',
+            processor='docling', scope=image_id, region_ids=entry['regions']))
+        try:
+            candidate = engines.run('docling', source=context['path'], scope=image_id, phase='comparison')
+            added = add_parsed(candidate, parent=image_id, unit=image['unit_id'], location=image['native_location'],
+                               selected=False, phase='comparison')
+            for item in added:
+                item['data']['context_for_regions'] = entry['regions']
+                item['data']['input_coordinate_system'] = 'containing_upright_image'
+                if item['bbox']:
+                    item['bbox']['coordinate_system'] = 'docling_image_input_points'
+            if not any('table' in b['content_types'] and b['data'].get('cells') for b in added):
+                review('image_context_table_structure_missing:' + image_id)
+        except AnalysisError as exc:
+            review('image_table_comparison:' + exc.code)
+
+    # A structurally incomplete PDF table is compared with its whole page,
+    # retaining page context. Candidate output never overwrites primary values.
+    if effective_fmt == 'pdf' and not primary_failed:
+        problem_pages = sorted({b['native_location'].get('page') for b in result['blocks']
+                                if b.get('selected', True) and 'table' in b['content_types']
+                                and not b['data'].get('cells') and b['native_location'].get('page')})
+        for page_no in problem_pages:
+            review('primary_table_structure_incomplete')
+            if len(ocr_jobs) + len(table_jobs) >= max_supplements:
+                review('supplement_limit_reached')
+                break
+            table_jobs.append({'comparison_page': page_no})
+            result['routing_decisions'].append(dict(phase='comparison', rule='missing_table_structure',
+                                                     processor='docling', scope={'page': page_no}))
+            one_page = work / ('compare-page-' + str(page_no) + '.pdf')
+            with fitz.open(effective) as doc, fitz.open() as target:
+                target.insert_pdf(doc, from_page=page_no - 1, to_page=page_no - 1)
+                target.save(one_page)
+            try:
+                candidate = engines.run('docling', source=one_page, scope={'page': page_no}, phase='comparison')
+                add_parsed(candidate, unit='page-' + str(page_no), location={'page': page_no}, selected=False, phase='comparison')
+            except AnalysisError as exc:
+                review('table_comparison:' + exc.code)
+
+    # Retain important-value conflicts. No automatic spelling/number repair.
+    native_text = '\n'.join(b['text'] for b in result['blocks'] if b['engine'] in {'native', 'openpyxl+xml', 'pymupdf'})
+    parsed_text = '\n'.join(b['text'] for b in result['blocks'] if b['id'].startswith('parsed-') and b.get('phase') == 'primary')
+    if parsed_text and native_text:
+        important = set(re.findall(r'(?<!\w)\d[\d,.-]{4,}\d(?!\w)', native_text))
+        absent = [value for value in important if value not in parsed_text]
+        if absent:
+            review('important_native_values_absent_from_primary')
+            result['quality'] = {'important_native_value_conflict_count': len(absent)}
+    for item in result['blocks']:
+        if item['status'] == 'review_required' or 'unknown' in item['content_types']:
+            review('unprocessed_or_ambiguous_object')
+    selected = [b for b in result['blocks'] if b.get('selected', True) and b['text'].strip()]
+    text_units = {b['unit_id'] for b in selected}
+    empty_units = [u['id'] for u in result['units'] if u['id'] not in text_units]
+    if empty_units:
+        review('units_without_extracted_text')
+    if fmt in {'hwp', 'hwpx'}:
+        for item in result['blocks']:
+            if 'page' in item['native_location']:
+                item['native_location'] = {**item['native_location'], 'converted_page': item['native_location']['page'],
+                                           'converted_artifact': result['conversions'][0]['artifact']}
+                del item['native_location']['page']
+        for unit in result['units']:
+            unit['native_location'] = {'converted_page': unit['native_location']['page'], 'converted_artifact': result['conversions'][0]['artifact']}
+    result['coverage'] = dict(total_units=len(result['units']), units_with_text=len(text_units), units_without_text=empty_units,
+                              source_image_objects=len(images), classified_image_objects=classified_count,
+                              unprocessed_image_objects=max(0, len(images) - classified_count))
+    result['status'] = 'partial' if result['review_required'] else 'succeeded'
+    result['timings']['total_seconds'] = time.perf_counter() - started
+    validate(result)
+    return project(result)

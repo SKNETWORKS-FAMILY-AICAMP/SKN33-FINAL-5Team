@@ -1,0 +1,121 @@
+import {designAttachmentError} from './design-attachments';
+import {WorkspaceIconButton} from './workspace-icon-button';
+import {useRef,useState} from 'react';
+import {ArrowRight, ArrowUp, FileText, FileSpreadsheet, FileImage, Plus, X, Layers, Workflow} from 'lucide-react';
+import './workspace-overview.css';
+
+type RecentWorkflow = {id:string; updated_at:string; config:{name:string}};
+const timestamp = new Intl.DateTimeFormat('ko-KR', {dateStyle:'medium', timeStyle:'short', timeZone:'Asia/Seoul'});
+
+function timeLabel(value:string) {
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? timestamp.format(time) : '';
+}
+
+export function WorkspaceOverview({memberName,workflows,loading,error,onStart,onNavigate,onRetry}:{
+  memberName?:string;
+  workflows:RecentWorkflow[];
+  loading:boolean;
+  error:string;
+  onStart:(prompt:string,files?:File[])=>void;
+  onNavigate:(page:'workflows'|'workflow'|'nodes', service?:string)=>void;
+  onRetry:()=>void;
+}) {
+  const [prompt,setPrompt]=useState('');
+  const [files,setFiles]=useState<File[]>([]);
+  const [fileError,setFileError]=useState('');
+  const fileInput=useRef<HTMLInputElement>(null);
+  const dragDepth=useRef(0);
+  const [dragOver,setDragOver]=useState(false);
+  function attachFiles(selected:File[]) {
+    const error=designAttachmentError(selected,files.length);
+    if(error){setFileError(error);return;}
+    setFiles(prior=>[...prior,...selected]);setFileError('');
+  }
+  const canStart=!!prompt.trim()||files.length>0;
+
+  return <div className="workspace-overview">
+    <section className="overview-welcome" aria-labelledby="overview-title">
+      <h1 id="overview-title">안녕하세요{memberName ? `, ${memberName}님` : ''}<br/>무엇을 도와드릴까요?</h1>
+      <form className={'overview-composer'+(dragOver?' is-drag-over':'')} data-tour="home-create"
+        onDragEnter={event=>{if(Array.from(event.dataTransfer.types).includes('Files')){event.preventDefault();dragDepth.current++;setDragOver(true);}}}
+        onDragLeave={event=>{event.preventDefault();if(dragDepth.current>0)dragDepth.current--;if(!dragDepth.current)setDragOver(false);}}
+        onDragOver={event=>{if(Array.from(event.dataTransfer.types).includes('Files'))event.preventDefault();}}
+        onDrop={event=>{
+          dragDepth.current=0;setDragOver(false);
+          const dropped=Array.from(event.dataTransfer.files);
+          if(!dropped.length)return;
+          event.preventDefault();
+          attachFiles(dropped);
+        }} onSubmit={event=>{
+        event.preventDefault();
+        if(canStart)onStart(prompt.trim(),files);
+      }}>
+        {files.length>0 && <div className="overview-attachment-tray" aria-label="첨부 자료">
+          {files.map((file,index)=>{
+            const extension=file.name.split('.').pop()?.toLowerCase()||'';
+            const AttachmentIcon=/^(csv|tsv|xlsx|xls)$/.test(extension)?FileSpreadsheet:/^(jpg|jpeg|png|bmp|webp|tif|tiff|heic)$/.test(extension)?FileImage:FileText;
+            const size=file.size>=1024*1024?`${(file.size/(1024*1024)).toFixed(1)} MB`:`${Math.ceil(file.size/1024)} KB`;
+            return <div className="overview-attachment" key={index}>
+              <span className="overview-attachment-icon"><AttachmentIcon size={21} aria-hidden="true"/></span>
+              <div className="overview-attachment-info"><strong title={file.name}>{file.name}</strong><small>{extension.toUpperCase()||'파일'} · {size}</small></div>
+              <WorkspaceIconButton type="button" aria-label={file.name+' 첨부 제거'} title="첨부 자료 제거" onClick={()=>{setFiles(prior=>prior.filter((_,i)=>i!==index));setFileError('');}}><X size={16} aria-hidden="true"/></WorkspaceIconButton>
+            </div>;
+          })}
+        </div>}
+        <textarea aria-label="자동화할 업무" placeholder="예: 매출표에서 지점별 합계를 구해 엑셀로 정리해 줘." value={prompt}
+          onChange={event=>setPrompt(event.target.value)}
+          onKeyDown={event=>{
+            if(event.key==='Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode!==229){
+              event.preventDefault();
+              event.currentTarget.form?.requestSubmit();
+            }
+          }}
+          rows={2} maxLength={4000}/>
+        {fileError && <p role="alert">{fileError}</p>}
+        <input ref={fileInput} type="file" multiple hidden accept=".csv,.tsv,.xlsx,.xls,.json,.txt,.md,.pdf,.doc,.docx,.ppt,.pptx,.hwp,.hwpx,.jpg,.jpeg,.png,.bmp,.webp,.tif,.tiff,.heic" onChange={event=>{
+          const selected=Array.from(event.currentTarget.files||[]);event.currentTarget.value='';
+          if(selected.length)attachFiles(selected);
+        }}/>
+        <div className="overview-composer-actions">
+          <WorkspaceIconButton type="button" className="overview-attach-button" aria-label="자료 추가" title="자료 추가" onClick={()=>fileInput.current?.click()}><Plus size={19} aria-hidden="true"/></WorkspaceIconButton>
+          <button type="submit" className="as-button as-primary overview-submit" aria-label="업무 입력 확인" disabled={!canStart}>
+            <ArrowUp size={17} aria-hidden="true"/>
+          </button>
+        </div>
+        {dragOver&&<div className="overview-drop-hint"><Plus size={18} aria-hidden="true"/><span>여기에 자료를 놓아주세요</span></div>}
+      </form>
+    </section>
+    <section className="overview-section" aria-labelledby="home-workflows">
+      <div className="overview-section-heading">
+        <h2 id="home-workflows">최근 작업</h2>
+        {workflows.length>0 && <button type="button" className="as-text-button" onClick={()=>onNavigate('workflows')}>전체 보기 <ArrowRight size={14} aria-hidden="true"/></button>}
+      </div>
+      {error ? <div className="as-error" role="alert">
+        <span>최근 워크플로우를 불러오지 못했습니다.</span><button type="button" onClick={onRetry}>다시 시도</button>
+      </div> : loading ? <p className="overview-empty" role="status">최근 작업을 불러오고 있습니다.</p> :
+      workflows.length > 0 ? <ul className="overview-recent-grid">{workflows.slice(0,3).map(workflow=><li key={workflow.id}>
+        <button type="button" className="overview-row" onClick={()=>onNavigate('workflow',workflow.id)}>
+          <span className="overview-icon"><Workflow size={17} aria-hidden="true"/></span>
+          <span className="overview-item"><strong>{workflow.config.name}</strong><small>{timeLabel(workflow.updated_at)}</small></span>
+          <ArrowRight size={15} aria-hidden="true"/>
+        </button>
+      </li>)}</ul> : <p className="overview-empty">저장된 워크플로우 없음</p>}
+    </section>
+    <section className="overview-section" aria-labelledby="home-library">
+      <div className="overview-section-heading"><h2 id="home-library">작업 라이브러리</h2></div>
+      <ul>
+        <li><button type="button" className="overview-row" onClick={()=>onNavigate('workflows')}>
+          <span className="overview-icon"><Workflow size={17} aria-hidden="true"/></span>
+          <span className="overview-item"><strong>저장한 워크플로우</strong></span>
+          <ArrowRight size={15} aria-hidden="true"/>
+        </button></li>
+        <li><button type="button" className="overview-row" onClick={()=>onNavigate('nodes')}>
+          <span className="overview-icon"><Layers size={17} aria-hidden="true"/></span>
+          <span className="overview-item"><strong>작업 템플릿</strong></span>
+          <ArrowRight size={15} aria-hidden="true"/>
+        </button></li>
+      </ul>
+    </section>
+  </div>;
+}

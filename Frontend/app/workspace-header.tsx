@@ -1,0 +1,62 @@
+import {useEffect, useState, type ReactNode} from 'react';
+import {Plus, HelpCircle} from 'lucide-react';
+import {ProductTour, shouldStartTour, type TourPanel} from './product-tour';
+import './workspace-chrome.css';
+import {AccountMenu} from './auth';
+import {AiStatus} from './ai-status';
+
+/** Preserve the supplied stacked logo artwork in every brand placement. */
+export function WorkspaceBrandMark() {
+  return <span className="workspace-brandmark">
+    <img src="/brand/a4b-logo.png" width="1254" height="1254" alt="A4B"/>
+  </span>;
+}
+
+type HeaderProps = {
+  onHome: () => void;
+  onNew?: () => void;
+  disabled?: boolean;
+  pending?: boolean;
+  actionLabel?: string;
+  actions?: ReactNode;
+};
+
+export function WorkspaceHeader({onHome, onNew, disabled = false, pending = false, actionLabel = '새 워크플로우', actions}: HeaderProps) {
+  const preview = new URLSearchParams(location.search).get('screen') === 'preview';
+
+  return <header className="workspace-header">
+    <button type="button" className="workspace-brand" aria-label="A4B 홈" onClick={onHome} disabled={disabled}>
+      <WorkspaceBrandMark/>
+    </button>
+    <div className="workspace-header-actions">
+      {actions}
+      {onNew && <button data-tour="create-workflow" className="as-button as-primary" onClick={onNew} disabled={disabled}>
+        <Plus size={16} aria-hidden="true"/>{actionLabel}
+      </button>}
+      {pending ? <span className="ai-status-badge" role="status">연결 확인 중</span> : preview ? <AccountMenu/> : <AiStatus/>}
+    </div>
+  </header>;
+}
+
+export function WorkspaceHelp({onStart, deferAutoStart = false, onTourPanelChange, currentTourPanel}: {
+  onStart?: () => void;
+  deferAutoStart?: boolean;
+  onTourPanelChange?: (panel: TourPanel) => void;
+  currentTourPanel?: TourPanel;
+}) {
+  const [open, setOpen] = useState(false);
+  const scope = new URLSearchParams(location.search).get('screen') || 'workflows';
+
+  useEffect(() => {
+    if (!deferAutoStart && shouldStartTour(scope)) setOpen(true);
+  }, [scope, deferAutoStart]);
+
+  return <>
+    <button type="button" data-tour="help" aria-label="사용 안내" title="사용 안내" className="as-button as-secondary" onClick={() => setOpen(true)}>
+      <HelpCircle size={16} aria-hidden="true"/><span className="workspace-menu-label">사용 안내</span>
+    </button>
+    <ProductTour scope={scope} open={open} onClose={() => setOpen(false)}
+      onStart={scope === 'workflows' ? onStart : undefined}
+      onPanelChange={onTourPanelChange} currentPanel={currentTourPanel}/>
+  </>;
+}

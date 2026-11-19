@@ -10,3 +10,15 @@
 *.png binary
 *.jpg binary
 *.jpeg binary
+
+# Preserve supplied package bytes and their checksum manifests.
+Backend/tests/fixtures/parser_handoff/** -text
+Backend/tests/fixtures/qwen_verifier/** -text
+Backend/ml/legacy/** -text
+runtime/ml-bundle/model/recommender_char_svm_5431.joblib -text whitespace=cr-at-eol
+runtime/ml-bundle/catalog/catalog_56.json -text whitespace=cr-at-eol
+
+# Evaluation records carry byte-level SHA256 provenance; keep their original bytes.
+scripts/verify/fixtures/*.json -text whitespace=cr-at-eol
+# Preserve the one CRLF source file covered by the frozen evaluation source hash.
+Backend/agent_builder/design/nodes/direct_conversation.py -text whitespace=cr-at-eol

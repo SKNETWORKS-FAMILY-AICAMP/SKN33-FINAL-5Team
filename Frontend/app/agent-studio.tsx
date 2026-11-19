@@ -1,132 +1,864 @@
+import {designAttachmentError} from './design-attachments';
+import {WorkspaceIconButton} from './workspace-icon-button';
+import {EditIconButton} from './edit-icon-button';
+import {WorkspacePageTitle} from './workspace-page-title';
+import {PageTransition} from './page-transition';
+import {WorkflowRenameDialog,renameWorkflow} from './workflow-rename-dialog';
+import {WorkflowPreview,type Workflow} from './workflow-preview';
+import {RuleSummary} from './node-inspector';
+import {NodePopover,type NodeEditRequest} from './node-popover';
+import {StudioMessage} from './studio-message';
+import {DesignFailureNotice,type DesignFailure} from './design-failure-notice';
+import {GmailSummaryResult,isGmailSlackSummaryWorkflow} from './gmail-summary-result';
+import {RunAnswer} from './run-answer';
+import {RunWorkflowDiagram} from './run-workflow-diagram';
+import {RunFileDownload, suggestedRunFilename} from './run-file-download';
+import {toolDescription} from './tool-copy';
+import {FileInspection,type InspectedFile} from './file-inspection';
+import {ReceiptQuestion, receiptFileTypes, type ReceiptAction} from './receipt-question';
+import {DocumentAnalysisSummary} from './document-analysis-summary';
+import {DocumentReviewPanel} from './document-review-panel';
+import type {DocumentReview,ReviewableAsset} from '../lib/document-review';
+import type {DocumentAnalysis} from '../lib/api-contracts';
 import {NodeLibrary,type LibraryNode,type ToolInfo} from './node-library';
 import {nodeSelectionPool} from './node-selection';
 import {shouldRefreshAgentRuns,refreshedAgentRun,startAgentRunRefresh} from './agent-run-refresh';
-import {useEffect,useRef,useState,type FormEvent} from 'react';
-import {ArrowLeft,ArrowUp,Check,ChevronDown,FileText,HelpCircle,Loader2,Paperclip,Plus,Sparkles,X,Settings2,Download,CheckCircle2,AlertCircle,Database,SlidersHorizontal,FileOutput,MessageSquare,KeyRound,CalendarClock,RefreshCw,ZoomIn,ZoomOut,Maximize2,Box} from 'lucide-react';
+import {useEffect,useRef,useState,type FormEvent,type ReactNode} from 'react';
+import {ArrowLeft,ArrowUp,Check,ChevronDown,FileText,Loader2,Paperclip,Plus,Play,CalendarClock,Workflow as WorkflowIcon,X,Settings2,CheckCircle2,AlertCircle,Database,SlidersHorizontal,FileOutput,MessageSquare,RefreshCw} from 'lucide-react';
 import {Dialog,DialogContent,DialogHeader,DialogTitle,DialogDescription} from '@/components/ui/dialog';
 import {request} from '@/components/flow/connection-panel';
-import type {CredentialPublic} from '@/server/contracts';
 import './agent-studio.css';
+import './run-workflow-diagram.css';
+import {TaskLibraryHeader,WorkspaceSidebar} from './workspace-nav';
+import {AttachUploadDialog} from './upload-library';
+import {DesignFolderPicker, resolveDesignFolder, type DesignFile, type FilePickerRequest} from './design-folder-picker';
+import {folderInputMode} from '../lib/design-folder-intent';
+import {WorkspaceHeader,WorkspaceHelp} from './workspace-header';
 import {ReplyReviewPanel,type ReplyReview} from './reply-review-panel';
+import {GmailConnection} from './gmail-connection';
+import {scheduleDescription,scheduleDateNote,type ScheduleSpec} from '../lib/schedule-spec';
+import {ScheduleLibrarySourceSettings,type ScheduleLibrarySource} from './schedule-library-source';
+import {ScheduleSettings} from './schedule-settings';
+import {type QuestionResponse,type ClarificationQuestionData} from './clarification-types';
+import {ClarificationForm,type ClarificationAnswer} from './clarification-form';
+import {SlackChannelPicker} from './slack-channel-picker';
 
-type Workflow={entry:string;nodes:{id:string;tool:string;label:string;bindings:{input:string;node_id:string;output:string}[];settings:Record<string,unknown>}[];edges:{source:string;target:string;branch:string}[]};
-type ScheduleSpec={frequency:'daily'|'weekly';timezone:string|null;hour:number|null;minute:number|null;weekday:number|null};
+
 type SavedSchedule={active:boolean;next_run_at:string;spec:ScheduleSpec;agent_version:number};
 type Source={id:string;asset_id:string;version:number;asset:Resource};
-type Job={id:string;kind:string;status:string;due_at:string;run_id?:string;error?:string};
-type Draft={schedule?:ScheduleSpec|null;report_destination?:string|null;workflow?:Workflow|null;name:string;purpose:string;instructions:string;tool_ids:string[];document_ids:string[];requirements:{description:string;source_id:string;quote:string}[];questions:string[];question_options?:string[][];unsupported:string[];explanation:string;execution_plan?:{match:string;filters:{field:string;operator:string;compare_field:string|null;value:unknown}[];sort:{field:string;direction:string;value_type:string}[];missing_policy:string;duplicate_policy:string;duplicate_field:string|null;output_format:string}};
-type Resource={id:string;name:string;kind:string;format:string;row_count:number;columns:string[];text:string;profile:Record<string,unknown>;warnings?:string[];engine?:string;page_count?:number;preview:Record<string,unknown>[]};
-type Session={id:string;revision:number;model:string;credential_id:string;agent_id:string|null;base_version:number;messages:{role:string;content:string}[];draft:Draft|null;status:string;issues:string[];trace:{node:string;label:string;status:string;detail:string}[];resources:Resource[];saved_agent_id?:string};
-type Agent={id:string;version:number;config:Draft;model:string;credential_id:string;updated_at:string;workflow_dependencies?:Record<string,Agent>};
+type Job={id:string;kind:string;status:string;due_at:string;run_id?:string;error?:string;source_name?:string;source_version?:string};
+type Draft={schedule?:ScheduleSpec|null;report_destination?:string|null;workflow?:Workflow|null;name:string;purpose:string;instructions:string;tool_ids:string[];document_ids:string[];requirements:{description:string;source_id:string;quote:string}[];questions:string[];question_options?:string[][];question_responses?:(QuestionResponse|null)[];unsupported:string[];explanation:string;execution_plan?:{match:string;filters:{field:string;operator:string;compare_field:string|null;value:unknown}[];sort:{field:string;direction:string;value_type:string}[];missing_policy:string;duplicate_policy:string;duplicate_field:string|null;output_format:string}};
+type Resource={original_path?:string;capabilities?:string[];parser_metadata?:{document_analysis?:DocumentAnalysis;document_review?:DocumentReview};id:string;name:string;kind:string;format:string;row_count:number;columns:string[];text:string;profile:Record<string,unknown>;warnings?:string[];engine?:string;page_count?:number;preview:Record<string,unknown>[]};
+type InputRequirement={node_id?:string;kind:string;timing:string;fields:string[];ready:boolean;description?:string};
+type RunFileRequirement = InputRequirement & {required_before_start:boolean; issues?:string[]; file_ids?:string[]};
+type RunInputs = {schedule_request_required?:boolean;request_required?:boolean; input_requirements?:RunFileRequirement[]; source_required?:boolean; required_connections?:string[]; library_source?:ScheduleLibrarySource|null};
+type Session={system_failure?:DesignFailure|null;last_generation_request_id?:string;requirement_failure?:DesignFailure|null;execution_mode?:'manual'|'scheduled'|null;file_inspection?:InspectedFile[];tool_gap?:{gap_id:string;revision:number}|null;input_requirements?:InputRequirement[];pending_questions?:{id:string;key:string;text:string;options?:string[];response?:QuestionResponse;group?:string;reason?:string;required?:boolean;action?:ReceiptAction;supersedes_texts?:string[]}[];id:string;revision:number;model:string;credential_id:string;agent_id:string|null;base_version:number;messages:{role:string;content:string}[];draft:Draft|null;status:string;issues:string[];trace:{node:string;label:string;status:string;detail:string}[];resources:Resource[];saved_agent_id?:string};
+type ConversationRecovery={before:Session;requestId:string;action:'message'|'confirm';includeSchedule?:boolean;content?:string;draftText?:string;fromComposer?:boolean;error:string;running:boolean;pollCount?:number};
+type GenerationRequest={request_id:string;result_revision?:number;workflow_id?:string;action:string;session_revision:number;request_text:string;status:string;reason?:string|null};
+type IncompleteWorkflow={summary?:string;questions?:{question:string}[];checklist?:string[];requirements?:{description:string;status:string}[]};
+
+function explainIncompleteWorkflow(result:IncompleteWorkflow,request:string):string {
+ const unique=(items:string[])=>[...new Set(items.map(item=>item.trim()).filter(Boolean))];
+ const needsInput=unique((result.requirements||[]).filter(item=>item.status==='needs_input').map(item=>item.description));
+ const unsupported=unique((result.requirements||[]).filter(item=>item.status==='unsupported').map(item=>item.description));
+ const questions=unique((result.questions||[]).map(item=>item.question));
+ const checklist=unique((result.checklist||[]).filter(item=>
+  !needsInput.some(detail=>item.includes(detail))&&!unsupported.some(detail=>item.includes(detail))));
+ const parts=['워크플로우 초안을 아직 만들지 못했어요.'];
+ const summary=result.summary?.trim();
+ if(summary&&summary!==request.trim()&&![...needsInput,...unsupported,...questions,...checklist].includes(summary))parts.push(summary);
+ if(needsInput.length)parts.push('아직 정해지지 않은 내용:\n'+needsInput.map(item=>'• '+item).join('\n'));
+ if(unsupported.length)parts.push('지원 여부를 확인할 작업:\n'+unsupported.map(item=>'• '+item).join('\n'));
+ if(checklist.length)parts.push('추가 확인 사항:\n'+checklist.map(item=>'• '+item).join('\n'));
+ if(questions.length)parts.push('답변해 주세요:\n'+questions.map((item,index)=>`${index+1}. ${item}`).join('\n'));
+ if(parts.length===1)parts.push('필요한 자료, 처리 조건, 결과를 보낼 곳을 알려주세요.');
+ return parts.join('\n\n');
+}
+
+type Agent={deleted_at?:string;id:string;version:number;config:Draft;model:string;credential_id:string;updated_at:string;workflow_dependencies?:Record<string,Agent>};
+function evidenceLocation(evidence:{page?:number|null;native_location?:Record<string,unknown>}|null):string {
+ const loc=evidence?.native_location;
+ if(loc?.sheet)return ' · '+String(loc.sheet)+(loc.cell?'!'+String(loc.cell):'');
+ if(loc?.slide)return ' · 슬라이드 '+String(loc.slide)+(loc.shape_id?' · 객체 '+String(loc.shape_id):'');
+ if(loc?.converted_page)return ' · 변환 PDF '+String(loc.converted_page)+'쪽';
+ if(loc?.frame)return ' · 이미지 프레임 '+String(loc.frame);
+ if(loc?.logical_row)return ' · '+String(loc.logical_row)+'행';
+ if(loc?.body_index)return ' · 본문 객체 '+String(loc.body_index);
+ return evidence?.page?' · '+String(evidence.page)+'쪽':'';
+}
 function usesTool(agent:Agent,tool:string,seen=new Set<string>()):boolean{if(seen.has(agent.id))return false;seen.add(agent.id);return agent.config.tool_ids.includes(tool)||Object.values(agent.workflow_dependencies||{}).some(child=>usesTool(child,tool,seen));}
-type TestRun={reviews?:ReplyReview[];approval_status?:string|null;id:string;status:string;answer:string;error?:string;steps:Session['trace'];rows:Record<string,unknown>[];artifact:{name:string;content:string;mime:string}|null;agent_version:number;trigger?:string;report_path?:string;source_version?:number;attempts?:{number:number;status:string;error?:string;started_at:string;finished_at?:string}[];question?:{question:string;node_id:string}|null;evidence?:{file_name:string;file_id?:string;page?:number|null;text?:string;quote?:string}[]};
+function gmailReadLimit(agent:Agent|null):number|undefined {
+ for(const node of agent?.config.workflow?.nodes||[])if(node.tool==='email.list'&&node.settings.operation==='read_messages'){
+  try{const limit=JSON.parse(String(node.settings.arguments_json||'{}')).max_results;return typeof limit==='number'?limit:undefined;}catch{return undefined;}
+ }
+ for(const child of Object.values(agent?.workflow_dependencies||{})){const limit=gmailReadLimit(child);if(limit!==undefined)return limit;}
+}
+type TestRun={library_source_files?:{space:string;team_id?:string|null;asset_id:string;execution_asset_id?:string;name:string;version:string}[];public_projection?:{history_preview?:boolean;evidence_returned:number;evidence_total:number;evidence_truncated:boolean;quote_truncated:boolean};config_snapshot?:{name?:string;workflow?:Workflow|null};reviews?:ReplyReview[];approval_status?:string|null;id:string;status:string;answer:string;error?:string;error_type?:string;steps:Session['trace'];rows:Record<string,unknown>[];artifact:{name:string;content:string;mime:string;encoding?:'base64'}|null;agent_version:number;trigger?:string;report_path?:string;source_version?:number;attempts?:{number:number;status:string;error?:string;started_at:string;finished_at?:string}[];question?:{question:string;node_id:string}|null;evidence?:{file_name:string;file_id?:string;page?:number|null;native_location?:Record<string,unknown>;text?:string;quote?:string}[]};
 const toolDetails:Record<string,{label:string;description:string;Icon:typeof Database}>={read_table:{label:'표 파일 읽기',description:'연결 자료의 실제 행을 읽습니다.',Icon:Database},filter_sort:{label:'조건에 따라 정리',description:'조건·정렬·예외 정책을 적용합니다.',Icon:SlidersHorizontal},write_result:{label:'결과 파일 만들기',description:'CSV·JSON 결과를 만듭니다.',Icon:FileOutput}};
 const samples:{label:string;text:string}[]=[];
+const RETRY_PROMPT='앞서 전달한 조건을 유지하고 업무 흐름 생성을 다시 시도해주세요.'; // must match backend is_generation_retry
+const PROJECTED_FAILURES=new Set(['execution_mode_questions','question_language_error']); // set by execution_mode.py / question_language.py
 async function asBase64(file:File){return new Promise<string>((accept,reject)=>{const reader=new FileReader();reader.onload=()=>accept(String(reader.result).split(',')[1]);reader.onerror=()=>reject(new Error('파일을 읽지 못했습니다.'));reader.readAsDataURL(file);});}
-function download(artifact:{name:string;content:string;mime:string}){const url=URL.createObjectURL(new Blob([artifact.content],{type:artifact.mime}));const a=document.createElement('a');a.href=url;a.download=artifact.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
-export default function AgentStudio(){
+function download(artifact:{name:string;content:string;mime:string;encoding?:'base64'}){const url=URL.createObjectURL(new Blob([artifact.encoding==='base64'?Uint8Array.from(atob(artifact.content),c=>c.charCodeAt(0)):artifact.content],{type:artifact.mime}));const a=document.createElement('a');a.href=url;a.download=artifact.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+async function downloadToolGap(session:Session){
+ const result=await request('/api/agent-builder/tool_gap?id='+encodeURIComponent(session.id)+'&revision='+session.revision);
+ download({name:'tool-gap-'+session.id+'.json',mime:'application/json',content:JSON.stringify(result.tool_gap,null,2)});
+}
+export default function AgentStudio({onNewWorkflow,onNavigate,onExternalFlow,onLocationChange,onCanLeaveChange,initialPrompt,initialFiles}:{onNewWorkflow?:()=>void;initialPrompt?:string;initialFiles?:File[];onLocationChange?:()=>void;onCanLeaveChange?:(fn:()=>boolean)=>void;onNavigate?:(next:'home'|'workflows'|'schedules'|'history'|'assets'|'connections'|'monitoring')=>void;onExternalFlow?:(id:string)=>void}={}){
  const initialScreen=new URLSearchParams(location.search).get('screen');
- const [screen,setScreen]=useState<'nodes'|'workflow'|'run'>(initialScreen==='nodes'||initialScreen==='run'?initialScreen:'workflow');
+ const [screen,setScreen]=useState<'nodes'|'workflow'|'run'|'schedule'>(initialScreen==='nodes'||initialScreen==='run'||initialScreen==='workflow'||initialScreen==='schedule'?initialScreen:new URLSearchParams(location.search).has('service')?'run':'workflow');
+ const screenRef=useRef(screen);screenRef.current=screen;
+ const externalPromptContext=useRef('');
+ const scheduleDirtyRef=useRef(false),internalHistoryIndex=useRef(Number(window.history.state?.a4bIndex||0));
+ const editorGrid=useRef<HTMLDivElement>(null);
+
+
+ const [libraryVisited,setLibraryVisited]=useState(initialScreen==='nodes');
+ const [renaming,setRenaming]=useState<Agent|null>(null);
+ const [highlightedNodeId,setHighlightedNodeId]=useState<string|null>(null);
  const [selectedNodeId,setSelectedNodeId]=useState<string|null>(null);
+ const [nodeTrigger,setNodeTrigger]=useState<HTMLElement|null>(null);
+ const [conversationCollapsed,setConversationCollapsed]=useState(false);
+ const [editorPanel,setEditorPanel]=useState<'conversation'|'canvas'|'settings'>('conversation');
+ const [settingsOpen,setSettingsOpen]=useState(false);
+ function showEditorPanel(panel:typeof editorPanel){
+  setEditorPanel(panel);
+  if(panel!=='canvas'&&window.innerWidth<=900)setSelectedNodeId(null);
+  if(panel==='settings')setSettingsOpen(true);
+ }
  const [library,setLibrary]=useState<LibraryNode[]>([]),[presets,setPresets]=useState<LibraryNode[]>([]),[catalog,setCatalog]=useState<ToolInfo[]>([]),[chosenRefs,setChosenRefs]=useState<string[]>([]),[chosenSnapshots,setChosenSnapshots]=useState<LibraryNode[]>([]);
  const nodeChoices=nodeSelectionPool([...presets,...library],chosenSnapshots,chosenRefs);
- function chooseNode(node:LibraryNode,checked:boolean){if(checked&&!chosenRefs.includes(node.ref)&&chosenRefs.length>=10)return;setChosenRefs(prior=>checked?prior.includes(node.ref)?prior:[...prior,node.ref]:prior.filter(ref=>ref!==node.ref));setChosenSnapshots(prior=>[...prior.filter(n=>n.ref!==node.ref),...(checked?[node]:[])]);}
- function go(next:'nodes'|'workflow'|'run'){setScreen(next);const url=new URL(location.href);url.searchParams.set('screen',next);window.history.replaceState(null,'',url);}
+ function go(next:'nodes'|'workflow'|'run'|'schedule',record=false){if(next!==screen){window.scrollTo({top:0,behavior:'instant'});setSelectedNodeId(null);}if(next==='nodes')setLibraryVisited(true);setScreen(next);const url=new URL(location.href);url.searchParams.set('screen',next);if(next!=='run')url.searchParams.delete('run');if(record&&url.href!==location.href)window.history.pushState({...window.history.state,a4bIndex:Number(window.history.state?.a4bIndex||0)+1,returnToDesign:next==='nodes'&&screen==='workflow'},'',url);else window.history.replaceState(window.history.state,'',url);internalHistoryIndex.current=Number(window.history.state?.a4bIndex||0);onLocationChange?.();}
+ function confirmSettingsExit(){return !scheduleDirtyRef.current||window.confirm('저장하지 않은 자료함 연결 또는 예약 설정이 있습니다. 이동하면 변경 내용이 사라집니다. 이동할까요?');}
+ function clearSettingsDirty(){scheduleDirtyRef.current=false;setScheduleSourceDirty(false);setScheduleSettingsDirty(false);}
+ function switchScreen(next:'nodes'|'workflow'|'run'|'schedule'){if(next!==screen){if(!confirmSettingsExit())return;clearSettingsDirty();}go(next,true);}
+ useEffect(()=>{onLocationChange?.();});
+ useEffect(()=>{const pop=()=>{const next=new URLSearchParams(location.search).get('screen');
+  if(next==='nodes'||next==='workflow'||next==='run'||next==='schedule'){
+   if(next!==screenRef.current&&!confirmSettingsExit()){
+    const delta=internalHistoryIndex.current-Number(window.history.state?.a4bIndex||0);
+    if(delta)window.history.go(delta);else{const url=new URL(location.href);url.searchParams.set('screen',screenRef.current);window.history.replaceState(window.history.state,'',url);onLocationChange?.();}return;
+   }
+   if(next!==screenRef.current)clearSettingsDirty();
+
+   if(next==='nodes')setLibraryVisited(true);setScreen(next);internalHistoryIndex.current=Number(window.history.state?.a4bIndex||0);
+  }
+ };window.addEventListener('popstate',pop);return()=>window.removeEventListener('popstate',pop);},[]);
  async function refreshLibrary(){const result=await request('/api/agent-builder/nodes');setLibrary(result.nodes);setPresets(result.defaults);}
 
- const [agents,setAgents]=useState<Agent[]>([]),[credentials,setCredentials]=useState<CredentialPublic[]>([]),[credentialId,setCredentialId]=useState(''),[model,setModel]=useState('gpt-4.1-mini');
- const [session,setSession]=useState<Session|null>(null),[selected,setSelected]=useState<Agent|null>(null),[agentResources,setAgentResources]=useState<Resource[]>([]),[text,setText]=useState(''),[busy,setBusy]=useState(''),[error,setError]=useState(''),[loading,setLoading]=useState(true);
- const [help,setHelp]=useState(false),[connection,setConnection]=useState(false),[apiKey,setApiKey]=useState(''),[connectionName,setConnectionName]=useState('OpenAI'),[connectionBusy,setConnectionBusy]=useState(false),[connectionError,setConnectionError]=useState('');
+ const [agents,setAgents]=useState<Agent[]>([]),[credentialId,setCredentialId]=useState(''),[model,setModel]=useState('');
+ const [session,setSession]=useState<Session|null>(null),[selected,setSelected]=useState<Agent|null>(null),[agentResources,setAgentResources]=useState<Resource[]>([]),[text,setText]=useState(initialPrompt ?? ''),[busy,setBusy]=useState(''),[error,setError]=useState(''),[loading,setLoading]=useState(true);
+ const [animatedMessage,setAnimatedMessage]=useState('');
+ const [externalMessages,setExternalMessages]=useState<Session['messages']>([]);
+ useEffect(()=>{
+  if(initialPrompt!==undefined&&window.history.state?.initialPrompt===initialPrompt){
+   const {initialPrompt:consumed,...state}=window.history.state;
+   window.history.replaceState(state,'',location.href);
+  }
+ },[initialPrompt]);
+ const initialFilePending=useRef(initialFiles);
+ const [initialFileReady,setInitialFileReady]=useState(!initialFiles?.length);
+ const initialPromptPending=useRef(!!initialPrompt?.trim());
+ const [pendingMessage,setPendingMessage]=useState('');
+  const pendingNodeEdit=useRef<NodeEditRequest|null>(null);
+ const [recovery,setRecovery]=useState<ConversationRecovery|null>(null);
+ const [initialLoadFailed,setInitialLoadFailed]=useState(false);
+ const [libraryBusy,setLibraryBusy]=useState(false),[libraryDirty,setLibraryDirty]=useState(false);
+ const [scheduleSourceDirty,setScheduleSourceDirty]=useState(false);
+ const [scheduleSettingsDirty,setScheduleSettingsDirty]=useState(false);
+ const [clarificationDirty,setClarificationDirty]=useState(false);
+ scheduleDirtyRef.current=scheduleSourceDirty||scheduleSettingsDirty;
+
+ const [runInputs,setRunInputs] = useState<RunInputs>({});
+ const [gmailConnected,setGmailConnected] = useState(false);
+ const [slackConnection,setSlackConnection] = useState<{agentId:string;connected:boolean}|null>(null);
+ function applyRunInputs(result:RunInputs & {resources:Resource[]}) {
+  setAgentResources(result.resources);
+  setRunInputs({schedule_request_required:result.schedule_request_required,request_required:result.request_required, input_requirements:result.input_requirements, source_required:result.source_required, required_connections:result.required_connections, library_source:result.library_source});
+ }
  const [resource,setResource]=useState<Resource|null>(null),[testText,setTestText]=useState(''),[testRun,setTestRun]=useState<TestRun|null>(null);
- const [runFiles,setRunFiles]=useState<Resource[]>([]),[evidence,setEvidence]=useState<{file_name:string;file_id?:string;page?:number|null;text?:string;quote?:string}|null>(null);
+ const [runFiles,setRunFiles]=useState<Resource[]>([]),[evidence,setEvidence]=useState<{file_name:string;file_id?:string;page?:number|null;native_location?:Record<string,unknown>;text?:string;quote?:string}|null>(null);
  const [replyDraft,setReplyDraft]=useState('');
  const [history,setHistory]=useState<TestRun[]>([]);
- const pinnedRun=useRef(false);
+ const [queuedSourceRuns,setQueuedSourceRuns]=useState<string[]>([]);
+ const pinnedRun=useRef(false),runDetailRequest=useRef(0);
  const [schedule,setSchedule]=useState<SavedSchedule|null>(null),[source,setSource]=useState<Source|null>(null),[jobs,setJobs]=useState<Job[]>([]),[scheduleNotice,setScheduleNotice]=useState('');
  const sourceInput=useRef<HTMLInputElement>(null);
  const resultPanel=useRef<HTMLDivElement>(null);
  const runFileInput=useRef<HTMLInputElement>(null);
  const fileInput=useRef<HTMLInputElement>(null),end=useRef<HTMLDivElement>(null),input=useRef<HTMLTextAreaElement>(null),inFlight=useRef(false),generation=useRef(0);
- async function refresh(){const [a,c,n,t]=await Promise.all([request('/api/agent-builder/agents'),request('/api/credentials'),request('/api/agent-builder/nodes'),request('/api/agent-builder/catalog')]);setLibrary(n.nodes);setPresets(n.defaults);setCatalog(t.tools);setAgents(a.agents);const accounts=(c.credentials||[]).filter((v:CredentialPublic)=>v.provider==='openai');setCredentials(accounts);setCredentialId(prior=>accounts.some((a:CredentialPublic)=>a.id===prior)?prior:accounts[0]?.id||'');}
- useEffect(()=>{let cancelled=false;(async()=>{try{await refresh();const id=localStorage.getItem('a4b-builder-session');if(id){try{const s=await request('/api/agent-builder/session?id='+encodeURIComponent(id));if(!cancelled){if(s.status==='saved'&&s.saved_agent_id){const saved=await request('/api/agent-builder/agent?id='+encodeURIComponent(s.saved_agent_id));if(!cancelled){setSelected(saved.agent);setAgentResources(saved.resources);setSchedule(saved.schedule);setSource(saved.source);setJobs(saved.jobs||[]);setTestRun(saved.tests[0]||null);setHistory(saved.tests||[]);}}else setSession(s);}}catch{localStorage.removeItem('a4b-builder-session');}}}catch(e){if(!cancelled)setError((e as Error).message);}finally{if(!cancelled)setLoading(false);}})();return()=>{cancelled=true;};},[]);
- useEffect(()=>{end.current?.scrollIntoView({behavior:'smooth',block:'end'});},[session?.messages.length,busy]);
+ useEffect(()=>()=>{generation.current++;},[]);
+ const [attachMode,setAttachMode]=useState<'choose'|'library'|null>(null);
+ const [filePicker,setFilePicker]=useState<FilePickerRequest|null>(null);
+ const [saveReviewOpen,setSaveReviewOpen]=useState(false),[includeSchedule,setIncludeSchedule]=useState(true);
+ async function refresh(signal?:AbortSignal,current=()=>true){
+  const [data,connection]=await Promise.all([request('/api/agent-builder/studio',undefined,undefined,signal),request('/api/agent-builder/connection?profile=1',undefined,undefined,signal)]);
+  if(!current())return;
+  setLibrary(data.nodes);setPresets(data.defaults);setCatalog(data.tools.map((tool:ToolInfo)=>({...tool,description:toolDescription(tool.id,tool.description)})));setAgents(data.agents);setModel(connection.connection?.model||'');setCredentialId(connection.connection?.credential.id||'');
+ }
+
+ useEffect(()=>{
+  let cancelled=false;
+  const controller=new AbortController();
+  const token=generation.current;
+  const current=()=>!cancelled&&!controller.signal.aborted&&generation.current===token;
+  const serviceId=new URLSearchParams(location.search).get('service');
+  const sessionId=localStorage.getItem('a4b-builder-session');
+  const selectedId=localStorage.getItem('a4b-selected-agent');
+  async function restoreAgent(id:string){
+   const result=await request('/api/agent-builder/agent?id='+encodeURIComponent(id),undefined,undefined,controller.signal);
+   if(!current())return;
+   setSelected(result.agent);setSession(null);applyRunInputs(result);
+   setSchedule(result.schedule);setSource(result.source);setJobs(result.jobs||[]);
+   const linkedRun=new URLSearchParams(location.search).get('run');
+   let restored=linkedRun?(result.tests||[]).find((r:TestRun)=>r.id===linkedRun):result.tests[0];
+   if(restored?.public_projection?.history_preview){
+    const detail=await request('/api/agent-builder/run?id='+encodeURIComponent(restored.id),undefined,undefined,controller.signal);
+    if(!current())return;
+    restored=detail.run;
+   }
+   setTestRun(restored||null);setHistory(result.tests||[]);pinnedRun.current=!!linkedRun;
+   if(linkedRun&&!restored)setError('지정한 실행 기록을 찾을 수 없습니다. 실행 기록에서 다시 선택하세요.');
+   localStorage.setItem('a4b-selected-agent',id);
+   localStorage.removeItem('a4b-builder-session');
+  }
+  void (async()=>{
+   try{
+    await Promise.all([refresh(controller.signal,current),(async()=>{
+    // Templates do not need to restore a remembered editor or its run history.
+    if(screen==='nodes')return;
+    // An explicit service link takes precedence over a remembered conversation.
+    if(serviceId)await restoreAgent(serviceId);
+    else if(sessionId){
+     const s=await request('/api/agent-builder/session?id='+encodeURIComponent(sessionId),undefined,undefined,controller.signal);
+     if(!current())return;
+     if(s.status==='saved'&&s.saved_agent_id)await restoreAgent(s.saved_agent_id);
+     else setSession(s);
+    }else if(selectedId)await restoreAgent(selectedId);
+    })()]);
+   }catch(e){if(current()){setInitialLoadFailed(true);setError((e as Error).message);}controller.abort();}
+   finally{if(!cancelled)setLoading(false);}
+  })();
+  return()=>{cancelled=true;controller.abort();};
+ },[]);
+ useEffect(()=>{const messages=end.current?.closest<HTMLElement>('.as-messages');if(messages&&(session?.messages.length||pendingMessage))messages.scrollTo?.({top:messages.scrollHeight,behavior:'smooth'});},[session?.messages.length,pendingMessage,busy]);
+ function clearRunInputs(){setRunFiles([]);setReplyDraft('');setTestText('');setScheduleNotice('');pinnedRun.current=false;}
  function remember(s:Session){setSession(s);localStorage.setItem('a4b-builder-session',s.id);}
- function reset(){if(inFlight.current)return;go('workflow');setChosenRefs([]);setChosenSnapshots([]);setSelectedNodeId(null);generation.current++;setSelected(null);setSession(null);setHistory([]);pinnedRun.current=false;setRunFiles([]);setSchedule(null);setSource(null);setJobs([]);setScheduleNotice('');setText('');setTestRun(null);setAgentResources([]);setError('');localStorage.removeItem('a4b-builder-session');localStorage.removeItem('a4b-selected-agent');const url=new URL(location.href);url.searchParams.delete('service');window.history.replaceState(null,'',url);setReplyDraft('');requestAnimationFrame(()=>input.current?.focus());}
- async function ensureSession(){if(session)return session;if(!credentialId)throw new Error('모델 연결 계정을 먼저 선택해주세요.');const s=await request('/api/agent-builder/sessions',{credentialId,model,nodeRefs:chosenRefs});return {...s,messages:[],draft:null,status:'empty',issues:[],trace:[],resources:[]} as Session;}
- async function send(event?:FormEvent){event?.preventDefault();if(inFlight.current||!text.trim())return;const content=text.trim();inFlight.current=true;setBusy('업무를 이해하고 설정을 구성하고 있습니다.');setError('');try{const s=await ensureSession();remember(s);const result=await request('/api/agent-builder/message',{id:s.id,revision:s.revision,content});remember(result);setText('');}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}}
- async function upload(file:File){if(inFlight.current)return;if(file.size>8*1024*1024){setError('자료는 8MB 이하로 연결하세요.');return;}inFlight.current=true;setBusy('파일의 열과 내용을 확인하고 있습니다.');setError('');try{const s=await ensureSession();remember(s);const result=await request('/api/agent-builder/upload',{id:s.id,revision:s.revision,fileName:file.name,data:await asBase64(file)});remember(result);}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');if(fileInput.current)fileInput.current.value='';}}
- async function save(){if(!session||inFlight.current)return;setSelectedNodeId(null);inFlight.current=true;setBusy('검증한 설정을 저장하고 있습니다.');setError('');try{const s=await request('/api/agent-builder/confirm',{id:session.id,revision:session.revision});remember(s);go('run');const savedUrl=new URL(location.href);savedUrl.searchParams.set('service',s.saved_agent_id);window.history.replaceState(null,'',savedUrl);await refresh();const result=await request('/api/agent-builder/agent?id='+encodeURIComponent(s.saved_agent_id));setSelected(result.agent);setAgentResources(result.resources);setSchedule(result.schedule);setSource(result.source);setJobs(result.jobs||[]);setTestRun(null);setHistory([]);pinnedRun.current=false;setTestText('');}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}}
- async function openAgent(agent:Agent){if(inFlight.current)return;setSelectedNodeId(null);go('run');const token=++generation.current;setBusy('에이전트를 불러오고 있습니다.');setError('');try{const result=await request('/api/agent-builder/agent?id='+encodeURIComponent(agent.id));if(token!==generation.current)return;setSelected(result.agent);setAgentResources(result.resources);setSchedule(result.schedule);setSource(result.source);setJobs(result.jobs||[]);setTestRun(result.tests[0]||null);setHistory(result.tests||[]);pinnedRun.current=false;setScheduleNotice('');setTestText('');setRunFiles([]);setReplyDraft('');setSession(null);localStorage.setItem('a4b-selected-agent',agent.id);const url=new URL(location.href);url.searchParams.set('service',agent.id);window.history.replaceState(null,'',url);localStorage.removeItem('a4b-builder-session');}catch(e){setError((e as Error).message);}finally{if(token===generation.current)setBusy('');}}
- async function edit(){if(!selected||inFlight.current)return;setSelectedNodeId(null);go('workflow');inFlight.current=true;setBusy('설정 수정 대화를 시작합니다.');setError('');try{const s=await request('/api/agent-builder/sessions',{credentialId:selected.credential_id,model:selected.model,agentId:selected.id});remember({...s,messages:[],draft:selected.config,status:'empty',issues:[],trace:[],resources:agentResources});setSelected(null);setTestRun(null);input.current?.focus();}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}}
- async function runTest(){if(!selected||inFlight.current||(!testText.trim()&&!selected.config.schedule&&!usesTool(selected,'read_table')))return;inFlight.current=true;setBusy('저장한 워크플로우를 실행하고 있습니다.');setError('');try{pinnedRun.current=false;const result=await request('/api/agent-builder/test',{id:selected.id,content:testText||'저장된 조건으로 관리 데이터 소스를 처리하고 보고서를 저장하세요.',fileIds:runFiles.map(f=>f.id),replyDraft:replyDraft||undefined});setTestRun(result);setHistory(prior=>[result,...prior.filter(r=>r.id!==result.id)]);requestAnimationFrame(()=>resultPanel.current?.scrollIntoView({behavior:'smooth',block:'start'}));if(result.question)setTestText('');}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}}
- const refreshRuns=shouldRefreshAgentRuns(!!selected?.config.schedule,testRun,history);
+ async function recoverConversation(attempt:ConversationRecovery):Promise<Session|null>{
+  const token=generation.current;
+  if(attempt.fromComposer)setText(attempt.draftText??attempt.content??'');
+  setRecovery(attempt);
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),15000);
+  try{
+   // Read history first: a running worker may publish its session just afterwards.
+   const history=await request<{requests:GenerationRequest[]}>('/api/agent-builder/generation_history?id='+encodeURIComponent(attempt.before.id),undefined,undefined,controller.signal);
+   let latest=await request<Session>('/api/agent-builder/session?id='+encodeURIComponent(attempt.before.id),undefined,undefined,controller.signal);
+   if(token!==generation.current)return null;
+   let repairActive=false;
+   const outcome=history.requests.find(item=>item.request_id===attempt.requestId&&item.action===attempt.action
+    &&item.session_revision===attempt.before.revision);
+   if(attempt.action==='confirm'&&outcome?.status==='succeeded'&&outcome.workflow_id&&latest.status!=='saved'){
+    const repair=await request<{recovered:boolean;reason?:string}>('/api/agent-builder/recover_generation',
+     {id:attempt.before.id,revision:latest.revision,generationRequestId:attempt.requestId},undefined,controller.signal);
+    repairActive=repair.reason==='active';
+    latest=await request<Session>('/api/agent-builder/session?id='+encodeURIComponent(attempt.before.id),undefined,undefined,controller.signal);
+    if(token!==generation.current)return null;
+    if(repair.reason==='changed'){
+     remember(latest);setRecovery(null);
+     setError('다른 요청에서 대화가 변경됐습니다. 최신 대화를 확인한 뒤 이어서 진행하세요.');
+     return null;
+    }
+    if(!repair.recovered&&!repairActive)throw new Error('저장 결과 복구를 확인하지 못했습니다.');
+   }
+   remember(latest);
+   const applied=latest.last_generation_request_id===attempt.requestId&&latest.revision>attempt.before.revision;
+   const successful=!!outcome&&['waiting_input','waiting_confirmation','succeeded'].includes(outcome.status);
+   const resultRevision=outcome?.result_revision;
+   const recorded=successful&&typeof resultRevision==='number'&&Number.isInteger(resultRevision)
+    &&resultRevision>attempt.before.revision&&latest.revision>=resultRevision;
+   const published=applied&&['ready','needs_clarification','saved'].includes(latest.status)
+    &&(!outcome||outcome.status==='running'||successful);
+   const delivered=attempt.action==='confirm'
+    ? latest.status==='saved'&&!!latest.saved_agent_id&&(published||successful&&outcome?.workflow_id===latest.saved_agent_id)
+    : recorded||published;
+   // Session publication can complete before the audit record is finalized.
+   if(!delivered&&(outcome?.status==='running'||repairActive)){
+    const pollCount=(attempt.pollCount??0)+1;
+    const running=pollCount<15;
+    setRecovery({...attempt,running,pollCount:running?pollCount:0});
+    setError(running?'서버에서 이전 요청을 처리하고 있습니다. 완료되면 대화를 갱신합니다.':
+     '서버의 처리 완료를 아직 확인하지 못했습니다. 이 대화 이어가기로 작업 종료를 확인하거나 다른 화면으로 이동할 수 있습니다. 중복 전송을 막기 위해 입력은 보존합니다.');
+    return null;
+   }
+   if(attempt.fromComposer)setText(delivered?'':attempt.draftText??attempt.content??'');
+   setRecovery(null);
+   setError(outcome&&['failed','blocked'].includes(outcome.status)?outcome.reason||attempt.error:delivered?'':attempt.error);
+   return attempt.action==='confirm'&&!delivered?null:latest;
+  }catch{
+   if(token===generation.current){
+    setRecovery({...attempt,running:false});
+    setError(attempt.error+' 대화 상태를 확인하지 못했습니다. 다시 불러온 뒤 이어서 진행하세요.');
+   }
+   return null;
+  }finally{clearTimeout(timer);}
+ }
+ async function reloadConversation(){
+  if(!recovery||inFlight.current)return;
+  const attempt=recovery;
+  inFlight.current=true;setBusy('서버의 대화 상태를 확인하고 있습니다.');
+  let latest:Session|null=null;
+  try{latest=await recoverConversation(attempt);}
+  finally{inFlight.current=false;setBusy('');}
+  if(attempt.action==='confirm'&&latest?.status==='saved'&&latest.saved_agent_id){if(attempt.includeSchedule)go('schedule');await openAgent({id:latest.saved_agent_id});}
+ }
+ async function resumeConversation(){
+  if(!recovery||recovery.running||inFlight.current||!session)return;
+  const attempt=recovery,token=generation.current;
+  inFlight.current=true;setBusy('이전 작업이 종료됐는지 확인하고 있습니다.');
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);
+  let latest:Session|null=null;
+  try{
+   const result=await request<{recovered:boolean;reason?:string}>('/api/agent-builder/recover_generation',
+    {id:attempt.before.id,revision:session.revision,generationRequestId:attempt.requestId},undefined,controller.signal);
+   if(token!==generation.current)return;
+   if(result.reason==='active'){
+    setError('서버에서 이전 작업을 처리 중입니다. 작업이 끝난 뒤 다시 확인하세요.');
+    return;
+   }
+   latest=await recoverConversation({...attempt,pollCount:14});
+  }catch(e){if(token===generation.current)setError('이전 작업의 종료를 확인하지 못했습니다. 입력은 보존됩니다. '+(e as Error).message);}
+  finally{clearTimeout(timer);inFlight.current=false;setBusy('');}
+  if(attempt.action==='confirm'&&latest?.status==='saved'&&latest.saved_agent_id){if(attempt.includeSchedule)go('schedule');await openAgent({id:latest.saved_agent_id});}
+ }
+ useEffect(()=>{
+  if(!recovery?.running)return;
+  const timer=window.setTimeout(()=>void reloadConversation(),2000);
+  return()=>window.clearTimeout(timer);
+ },[recovery]);
+ function updateReviewedAsset(asset:ReviewableAsset){
+  const next=asset as Resource;
+  setResource(next);setSession(prior=>prior?{...prior,resources:prior.resources.map(item=>item.id===next.id?next:item)}:prior);
+  setAgentResources(prior=>prior.map(item=>item.id===next.id?next:item));setRunFiles(prior=>prior.map(item=>item.id===next.id?next:item));
+  setSource(prior=>prior?.asset.id===next.id?{...prior,asset:next}:prior);
+ }
+ function reset(){if(inFlight.current||recovery?.running)return;setConversationCollapsed(false);setRecovery(null);externalPromptContext.current='';setExternalMessages([]);go('workflow');window.scrollTo({top:0,behavior:'instant'});setChosenRefs([]);setChosenSnapshots([]);setSelectedNodeId(null);setEditorPanel('conversation');generation.current++;setSelected(null);setSession(null);setHistory([]);pinnedRun.current=false;setRunFiles([]);setSchedule(null);setSource(null);setJobs([]);setQueuedSourceRuns([]);setSaveReviewOpen(false);setScheduleSourceDirty(false);setScheduleSettingsDirty(false);setClarificationDirty(false);setScheduleNotice('');setText('');setTestText('');setTestRun(null);setAgentResources([]);setError('');localStorage.removeItem('a4b-builder-session');localStorage.removeItem('a4b-selected-agent');const url=new URL(location.href);url.searchParams.delete('service');url.searchParams.delete('run');url.searchParams.delete('executionMode');window.history.replaceState(window.history.state,'',url);setReplyDraft('');requestAnimationFrame(()=>input.current?.focus({preventScroll:true}));}
+
+ async function ensureSession(){generation.current++;if(session)return session;if(!credentialId)throw new Error('설계 서비스를 준비하지 못했습니다. 잠시 후 다시 시도해주세요.');const s=await request('/api/agent-builder/sessions',{credentialId,model,nodeRefs:chosenRefs});return {...s,messages:[],draft:null,status:'empty',issues:[],trace:[],resources:[]} as Session;}
+  async function connectDesignFiles(start:Session,files:DesignFile[]):Promise<Session>{
+   let current=start;
+   for(const file of files){
+    if(current.resources.some(resource=>resource.id===file.id))continue;
+    let next:Session;
+    try{next=await request<Session>('/api/agent-builder/attach_asset',{id:current.id,revision:current.revision,assetId:file.id});}
+    catch(error){
+     const latest=await request<Session>('/api/agent-builder/session?id='+encodeURIComponent(current.id)).catch(()=>null);
+     if(latest)remember(latest);
+     throw error;
+    }
+    if(!next.resources.some(resource=>resource.id===file.id))throw new Error('선택한 파일의 연결을 확인하지 못했습니다.');
+    current=next;
+    remember(current);
+   }
+   return current;
+  }
+  async function send(event?:FormEvent,choice?:string,questionId?:string,answers?:ClarificationAnswer[],selectedFiles?:DesignFile[]){
+  event?.preventDefault();
+  const draftText=text;
+   let content=(choice??draftText).trim();
+  if(inFlight.current||recovery||!content)return;
+  const requestId=crypto.randomUUID();
+  inFlight.current=true;
+  const fromComposer=choice===undefined;
+  const preparedNodeEdit=fromComposer&&!answers?.length&&!selectedFiles?.length&&
+   pendingNodeEdit.current?.request===content&&!!pendingNodeEdit.current.changes.length;
+  if(fromComposer)setText('');
+  setPendingMessage(content);
+  setBusy(preparedNodeEdit?'설정 변경을 검증하고 있습니다.':choice===RETRY_PROMPT?'입력한 조건을 유지하고 다시 구성하고 있습니다.':'업무를 이해하고 설정을 구성하고 있습니다.');
+  setSelectedNodeId(null);
+  setError('');
+  let sentSession:Session|null=null;
+  try{
+    let files=selectedFiles||answers?.flatMap(answer=>answer.files||[]);
+    const folderMode=fromComposer&&!files?folderInputMode(content):undefined;
+    if(folderMode){
+     setBusy('자료함 폴더와 파일을 확인하고 있습니다.');
+     const match=await resolveDesignFolder(content,session?.resources||[],folderMode);
+     if(!match.files){
+      setText(draftText);
+      setFilePicker({hint:content,initialFolder:match.folder?.id,notice:match.notice,apply:picked=>{void send(undefined,undefined,undefined,undefined,picked);}});
+      return;
+     }
+     files=match.files;
+    }
+   const editingWorkflow=!!session?.draft?.workflow;
+   const gmailSlackRequest=/(?:Gmail|지메일)/i.test(content)&&/(?:Slack|슬랙)/i.test(content);
+   if(!questionId&&!answers?.some(answer=>answer.questionId)&&!files?.length&&!editingWorkflow&&!gmailSlackRequest&&(externalPromptContext.current||/Google Sheets|구글 ?시트|스프레드시트|Slack|슬랙|외부 ?API|Webhook|웹훅|REST API|API ?연동|API에서/i.test(content))){
+    const prompt=externalPromptContext.current?`${externalPromptContext.current}\n추가 답변: ${content}`:content;
+    const result=await request<{workflow?:{id:string};summary?:string;questions?:{question:string}[];checklist?:string[];requirements?:{id:string;description:string;status:string}[]}>('/api/workflows/from-request',{prompt});
+    if(!result.workflow){externalPromptContext.current=prompt;setExternalMessages(prior=>[...prior,{role:'user',content},{role:'assistant',content:explainIncompleteWorkflow(result,prompt)}]);return;}
+    externalPromptContext.current='';
+    setExternalMessages([]);
+    onExternalFlow?.(result.workflow.id);
+    return;
+   }
+   if((editingWorkflow||gmailSlackRequest)&&externalPromptContext.current){externalPromptContext.current='';setExternalMessages([]);}
+    let s=await ensureSession();
+   remember(s);
+    if(files?.length){
+     setBusy('자료함 파일을 설계에 연결하고 있습니다.');
+     s=await connectDesignFiles(s,files);
+     content+='\n이번에 읽을 파일: '+files.map(file=>file.name).join(', ');
+     if(content.length>4000)throw new Error('파일명을 포함해 업무 설명을 4,000자 이내로 줄여주세요.');
+     setPendingMessage(content);
+    }
+    sentSession=s;
+    const nodeEdit=fromComposer&&!files?.length&&pendingNodeEdit.current?.request===content&&pendingNodeEdit.current.changes.length
+     ?pendingNodeEdit.current:undefined;
+    setBusy(nodeEdit?'설정 변경을 검증하고 있습니다.':choice===RETRY_PROMPT?'입력한 조건을 유지하고 다시 구성하고 있습니다.':'업무를 이해하고 설정을 구성하고 있습니다.');
+   const userTimezone=Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const result=await request('/api/agent-builder/message',{id:s.id,revision:s.revision,content,userTimezone,generationRequestId:requestId,...(nodeEdit?{nodeEdit}:{}),...(answers?.some(answer=>answer.questionId)?{answers:answers.filter(answer=>answer.questionId).map(({questionId,value,custom,skip})=>({questionId,value,...(custom?{custom:true}:{}),...(skip?{skip:true}:{})}))}:{}),...(questionId?{questionId}:{})});
+    if(nodeEdit)pendingNodeEdit.current=null;
+   const lastReply=(result.messages as Session['messages']|undefined)?.findLastIndex(message=>message.role==='assistant')??-1;
+   setAnimatedMessage(result.id+':'+lastReply);
+   remember(result);
+   setFreshFiles({session:'',ids:[]});  // the message has now used every attached file
+  }catch(e){
+   let restored:Session|null=null;
+   if(sentSession)restored=await recoverConversation({before:sentSession,requestId,action:'message',content,draftText,fromComposer,error:(e as Error).message,running:false});
+   else{if(fromComposer)setText(draftText);setError((e as Error).message);}
+   if(answers&&!restored)throw e;
+
+  }finally{
+   inFlight.current=false;
+   setPendingMessage('');
+   setBusy('');
+  }
+ }
+ useEffect(()=>{
+  if(!initialFileReady||!initialPromptPending.current||loading||initialLoadFailed||!credentialId||screen!=='workflow')return;
+  initialPromptPending.current=false;
+  void send();
+ },[loading,initialLoadFailed,credentialId,screen,initialFileReady,session]);
+ useEffect(()=>{
+  if(!initialFilePending.current||loading||initialLoadFailed||!credentialId||screen!=='workflow')return;
+  const files=initialFilePending.current;initialFilePending.current=undefined;
+  const {initialFiles:consumed,...historyState}=window.history.state||{};
+  window.history.replaceState(historyState,'',window.location.href);
+  void attachResources(files).then(()=>setInitialFileReady(true));
+ },[loading,initialLoadFailed,credentialId,screen]);
+ async function answerQuestions(answers:ClarificationAnswer[]){
+  const content=answers.map(answer=>answer.text+' → '+(answer.skip?'선택사항 건너뛰기':answer.files?.length?`${answer.folderPath||'자료함'}: ${answer.files.map(file=>file.name).join(', ')}`:Array.isArray(answer.value)?answer.value.join(', '):String(answer.value))).join('\n');
+  if(content.length>4000)throw new Error('답변은 전체 4,000자까지 보낼 수 있습니다. 내용을 줄여주세요.');
+  await send(undefined,content,undefined,answers);
+ }
+ // Files attached since the last message, per session: only these get a summary mid-conversation.
+ const [freshFiles,setFreshFiles]=useState<{session:string;ids:string[]}>({session:'',ids:[]});
+  async function attachSelectedDesignFiles(files:DesignFile[]){
+   if(inFlight.current||recovery)return;
+   inFlight.current=true;setBusy('자료함 파일을 설계에 연결하고 있습니다.');setError('');
+   try{const s=await ensureSession();remember(s);await connectDesignFiles(s,files);}
+   catch(e){setError((e as Error).message);}
+   finally{inFlight.current=false;setBusy('');}
+  }
+ async function attachResource(source:File|string){return attachResources([source]);}
+ async function attachResources(sources:(File|string)[]) {
+  if(inFlight.current||recovery||!sources.length)return;
+  const files=sources.filter((source):source is File=>typeof source!=='string');
+  const validation=designAttachmentError(files,session?.resources?.length||0);
+  if(validation){initialPromptPending.current=false;setError(validation);return;}
+  if(receiptQuestion&&files.some(file=>!receiptFileTypes.split(',').some(ext=>file.name.toLowerCase().endsWith(ext)))){
+   initialPromptPending.current=false;setError('영수증 사진이나 PDF 파일을 선택해 주세요.');return;
+  }
+  inFlight.current=true;setBusy('자료의 열과 내용을 확인하고 있습니다.');setError('');
+  try {
+   let current=await ensureSession();remember(current);
+   for(const [index,source] of sources.entries()){
+    setBusy(`자료를 연결하고 있습니다. (${index+1}/${sources.length})`);
+    const sessionRef={id:current.id,revision:current.revision};
+    const before=new Set((current.resources||[]).map(resource=>resource.id));
+    const result=typeof source==='string'
+      ? await request('/api/agent-builder/attach_asset',{...sessionRef,assetId:source})
+      : await request('/api/agent-builder/upload',{...sessionRef,fileName:source.name,data:await asBase64(source)});
+    remember(result);current=result;
+    const added=((result.resources||[]) as Resource[]).map(resource=>resource.id).filter(id=>!before.has(id));
+    setFreshFiles(prior=>({session:result.id,ids:[...(prior.session===result.id?prior.ids:[]),...added]}));
+   }
+  } catch(e){initialPromptPending.current=false;setError((e as Error).message);}
+  finally{inFlight.current=false;setBusy('');}
+ }
+
+ function reviewSave(){if(session?.draft?.schedule){setIncludeSchedule(true);setSaveReviewOpen(true);}else void save(false);}
+ async function save(includeSchedule=!!session?.draft?.schedule){
+  if(!session||session.status==='saved'||inFlight.current||recovery)return;
+  const withSchedule=includeSchedule&&!!session.draft?.schedule;
+  setSaveReviewOpen(false);
+  const requestId=crypto.randomUUID();
+  generation.current++;setSelectedNodeId(null);inFlight.current=true;setBusy('검증한 설정을 저장하고 있습니다.');setError('');
+  try{
+   let s:Session;
+   try{s=await request('/api/agent-builder/confirm',{id:session.id,revision:session.revision,generationRequestId:requestId,includeSchedule:withSchedule});}
+   catch(e){
+    const latest=await recoverConversation({before:session,requestId,action:'confirm',includeSchedule:withSchedule,error:(e as Error).message,running:false});
+    if(!latest||latest.status!=='saved'||!latest.saved_agent_id)return;
+    s=latest;
+   }
+   const savedId=s.saved_agent_id;
+   if(!savedId)throw new Error('저장 결과를 확인하지 못했습니다. 대화를 다시 불러와 주세요.');
+   remember(s);clearRunInputs();
+   const savedUrl=new URL(location.href);savedUrl.searchParams.set('service',savedId);window.history.replaceState(window.history.state,'',savedUrl);
+
+   // A successful write must not depend on refreshing unrelated lists.
+   const [agentResult,listResult]=await Promise.allSettled([
+    request('/api/agent-builder/agent?id='+encodeURIComponent(savedId)),refresh()
+   ]);
+   if(agentResult.status==='fulfilled'){
+    const result=agentResult.value;setSelected(result.agent);applyRunInputs(result);
+    setSchedule(result.schedule);setSource(result.source);setJobs(result.jobs||[]);setTestRun(null);setHistory([]);
+    go(withSchedule?'schedule':'run');
+    localStorage.setItem('a4b-selected-agent',savedId);localStorage.removeItem('a4b-builder-session');
+    if(listResult.status==='rejected')setError('저장은 완료됐지만 목록을 갱신하지 못했습니다. '+String(listResult.reason?.message||listResult.reason));
+   }else{
+    setSelected(null);
+    go(withSchedule?'schedule':'run');
+    setError('저장은 완료됐지만 워크플로우를 불러오지 못했습니다. 아래 다시 불러오기를 눌러주세요.');
+   }
+  }catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}
+ }
+
+ async function openAgent(agent:Pick<Agent,'id'>){if(inFlight.current)return;setSelectedNodeId(null);const token=++generation.current;setBusy('워크플로우를 불러오고 있습니다.');setError('');try{const result=await request('/api/agent-builder/agent?id='+encodeURIComponent(agent.id));if(token!==generation.current)return;clearSettingsDirty();setSelected(result.agent);go(screen==='schedule'?'schedule':'run');setQueuedSourceRuns([]);applyRunInputs(result);setSchedule(result.schedule);setSource(result.source);setJobs(result.jobs||[]);setTestRun(result.tests[0]||null);setHistory(result.tests||[]);pinnedRun.current=false;setScheduleNotice('');setTestText('');setRunFiles([]);setReplyDraft('');setSession(null);localStorage.setItem('a4b-selected-agent',agent.id);const url=new URL(location.href);url.searchParams.set('service',agent.id);window.history.replaceState(window.history.state,'',url);localStorage.removeItem('a4b-builder-session');}catch(e){if(token===generation.current)setError((e as Error).message);}finally{if(token===generation.current)setBusy('');}}
+ async function edit(initialRequest?:string){if(!selected||selected.deleted_at||inFlight.current||!confirmSettingsExit())return;clearSettingsDirty();generation.current++;setSelectedNodeId(null);inFlight.current=true;setBusy('설정 수정 대화를 시작합니다.');setError('');try{const s=await request('/api/agent-builder/sessions',{credentialId:selected.credential_id,model:selected.model,agentId:selected.id});remember({...s,messages:[],draft:selected.config,status:'empty',issues:[],trace:[],resources:agentResources});const url=new URL(location.href);url.searchParams.delete('service');window.history.replaceState(window.history.state,'',url);clearRunInputs();setSelected(null);setTestRun(null);setConversationCollapsed(false);setEditorPanel('conversation');go('workflow');if(initialRequest)setText(initialRequest);requestAnimationFrame(()=>input.current?.focus());}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}}
+
+ const requestRequired = runInputs.request_required ?? !selected?.config.schedule;
+ const scheduleRequestRequired = runInputs.schedule_request_required ?? requestRequired;
+ const sourceFreeSchedule = !!schedule && runInputs.source_required === false;
+ const gmailRequired = !!runInputs.required_connections?.includes('gmail');
+ const slackRequired = !!runInputs.required_connections?.includes('slack');
+ const slackConnected = !!selected && slackConnection?.agentId===selected.id && slackConnection.connected;
+ const uncertainSlackDelivery = testRun?.error_type==='SlackDeliveryUnknown' || (testRun?.error_type==='InterruptedExecution' && slackRequired);
+ useEffect(()=>{
+  if(!slackRequired||!selected)return;
+  let active=true;
+  const agentId=selected.id;
+  async function refreshSlack(){
+   try{
+    const result=await request<{credentials:{provider:string;service?:string}[]}>('/api/credentials');
+    if(active)setSlackConnection({agentId,connected:result.credentials.some(c=>c.provider==='slack'&&(c.service==='slack'||!c.service))});
+   }catch{if(active)setSlackConnection({agentId,connected:false});}
+  }
+  void refreshSlack();window.addEventListener('focus',refreshSlack);
+  return()=>{active=false;window.removeEventListener('focus',refreshSlack);};
+ },[slackRequired,selected?.id]);
+ const gmailSchedule = sourceFreeSchedule && gmailRequired;
+ const scheduleSourceReady = (!!runInputs.library_source || (sourceFreeSchedule ? (!gmailSchedule || gmailConnected) : !!source))&&(!slackRequired||slackConnected);
+ const fileRequirements = runInputs.input_requirements || [];
+ const requiredFiles = fileRequirements.filter(item => item.required_before_start);
+ const mixedFileKinds = new Set(fileRequirements.map(item => item.kind)).size > 1;
+ const sourceChecked = source && fileRequirements.some(item => item.file_ids?.includes(source.asset_id));
+ const effectiveUploads = screen==='schedule' ? (source && !sourceChecked ? [source.asset] : []) : runFiles.length?runFiles:(source && !sourceChecked?[source.asset]:[]);
+ const missingFile = requiredFiles.find(item => {
+  if(runInputs.library_source&&(screen==='schedule'||!runFiles.length)&&item.node_id===runInputs.library_source.target_node_id)return false;
+
+  if (!effectiveUploads.length) return !item.ready;
+  const hasFile = effectiveUploads.some(file => file.kind === item.kind || file.capabilities?.includes(item.kind) ||
+   (item.kind === 'document' && file.parser_metadata?.document_analysis?.contract_version === 'a4b.document_analysis.v1' && file.text?.trim()));
+  return !hasFile && !(mixedFileKinds && item.ready);
+ });
+ const savedRunFileIds = new Set(requiredFiles.filter(item => item.ready).flatMap(item => item.file_ids || []));
+ const savedRunFileNames = [...savedRunFileIds].map(id =>
+  (source?.asset.id === id ? source.asset : agentResources.find(file => file.id === id))?.name
+ ).filter(Boolean);
+ const fileHint = missingFile
+  ? (missingFile.issues?.[0] || (missingFile.kind === 'document' ? '실행할 문서를 첨부해 주세요.' : '실행할 표 파일을 첨부해 주세요.'))
+  : runFiles.length && runInputs.library_source
+   ? '이번에는 첨부한 파일을 사용합니다. 저장한 자료함 연결은 유지됩니다.'
+  : !runFiles.length && runInputs.library_source
+   ? '연결한 자료함에서 읽습니다. 이번 실행 자료를 추가하면 자료함 대신 첨부한 파일을 사용합니다.'
+  : !runFiles.length && savedRunFileNames.length
+   ? '저장된 자료: ' + savedRunFileNames.join(', ') + '. 새 파일을 첨부하면 해당 종류의 자료를 교체합니다.'
+   : !runFiles.length && selected?.config.document_ids.some(id=>!agentResources.some(asset=>asset.id===id))
+   ? '기존 참고 파일이 삭제됐습니다. 해당 파일이 필요한 실행에는 새 자료를 추가하세요.'
+   : '새 자료를 넣으면 이번 실행에 사용합니다.';
+ const canStartRun = !selected?.deleted_at && !scheduleSourceDirty && !(screen==='schedule'&&scheduleSettingsDirty) && !missingFile && (screen==='schedule'?!scheduleRequestRequired:!requestRequired||!!testText.trim()) && (!gmailRequired || gmailConnected) && (!slackRequired || slackConnected);
+
+ const sourceReaders=fileRequirements.filter(item=>item.node_id&&selected?.config.workflow?.nodes.some(node=>node.id===item.node_id&&!node.settings.operation&&['read_table','read_document'].includes(node.tool))).map(item=>({id:item.node_id!,kind:item.kind,label:selected?.config.workflow?.nodes.find(node=>node.id===item.node_id)?.label||item.description||(item.kind==='table'?'표 파일 읽기':'문서 읽기')}));
+ async function refreshScheduleSource(){
+  if(!selected)return;
+  const id=selected.id,token=generation.current,result=await request('/api/agent-builder/agent?id='+encodeURIComponent(id));
+  if(token!==generation.current)return;
+  applyRunInputs(result);setSchedule(result.schedule);setSource(result.source);setJobs(result.jobs||[]);
+ }
+ const librarySourceSettings=selected&&sourceReaders.length>0?<ScheduleLibrarySourceSettings key={selected.id+':'+screen} workflowId={selected.id} readers={sourceReaders} disabled={!!busy||!!recovery||libraryBusy} onDirtyChange={setScheduleSourceDirty} onBusyChange={value=>{inFlight.current=value;setBusy(value?"자료함 연결을 저장합니다.":"");}} onSaved={async changed=>{if(changed)setQueuedSourceRuns([]);await refreshScheduleSource();}}/>:null;
+
+ async function runTest(){
+  if(!selected||inFlight.current||!canStartRun)return;
+  inFlight.current=true;setBusy('저장한 워크플로우를 실행하고 있습니다.');setError('');
+  try{
+   pinnedRun.current=false;
+   const result=await request('/api/agent-builder/test',{
+    id:selected.id,content:screen==='schedule'?'':testText.trim()?testText:'',fileIds:screen==='schedule'?[]:runFiles.map(f=>f.id),
+    replyDraft:screen==='schedule'?undefined:replyDraft||undefined,...(screen==='schedule'?{useSchedule:true}:{})
+   });
+   if(result.status==='expanded'){
+    pinnedRun.current=!(result.job_ids?.length);
+    setQueuedSourceRuns(result.job_ids||[]);setTestRun(null);
+    setScheduleNotice('새 파일 '+(result.enqueued_count||0)+'개를 실행 대기열에 등록했습니다. 처리 결과는 실행 기록에 표시됩니다.');
+    await refreshScheduleSource();return;
+   }
+   if(result.status==='skipped'){
+    pinnedRun.current=true;
+    setQueuedSourceRuns([]);setTestRun(null);setScheduleNotice(result.message||'새로 처리할 파일이 없습니다.');
+    await refreshScheduleSource();return;
+   }
+   setQueuedSourceRuns([]);
+   setTestRun(result);setHistory(prior=>[result,...prior.filter(r=>r.id!==result.id)]);
+   requestAnimationFrame(()=>resultPanel.current?.scrollIntoView({behavior:'smooth',block:'start'}));if(result.question)setTestText('');
+  }catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}
+ }
+ const refreshRuns=shouldRefreshAgentRuns(!!schedule,testRun,history);
  useEffect(()=>{
   if(!selected||busy||!refreshRuns)return;
   const id=selected.id,token=generation.current;
-  return startAgentRunRefresh(()=>request('/api/agent-builder/agent?id='+encodeURIComponent(id)),result=>{
+  return startAgentRunRefresh(async()=>{
+   const result=await request('/api/agent-builder/agent?id='+encodeURIComponent(id));
+   if(pinnedRun.current&&testRun?.id&&(result.tests||[]).some((run:TestRun)=>run.id===testRun.id&&run.public_projection?.history_preview)){
+    const detail=await request('/api/agent-builder/run?id='+encodeURIComponent(testRun.id));
+    result.tests=result.tests.map((run:TestRun)=>run.id===detail.run.id?detail.run:run);
+   }
+   return result;
+  },result=>{
    setSelected(prior=>prior?.id===id&&prior.version!==result.agent.version?result.agent:prior);
-   setAgentResources(result.resources);setSchedule(result.schedule);setSource(result.source);setJobs(result.jobs||[]);
-   setHistory(result.tests||[]);setTestRun(prior=>refreshedAgentRun(result.tests||[],prior,pinnedRun.current));
+   applyRunInputs(result);setSchedule(result.schedule);setSource(result.source);setJobs(result.jobs||[]);
+   const queued=queuedSourceRuns.length?(result.tests||[]).find((run:TestRun)=>queuedSourceRuns.includes(run.id)):null;
+   if(queued)setQueuedSourceRuns([]);
+   setHistory(result.tests||[]);setTestRun(prior=>queuedSourceRuns.length?queued||prior:refreshedAgentRun(result.tests||[],prior,pinnedRun.current));
   },()=>inFlight.current||generation.current!==token);
- },[selected?.id,refreshRuns,busy]);
- async function uploadSource(file:File){if(!selected||inFlight.current)return;inFlight.current=true;setBusy('다음 실행에 사용할 데이터 소스를 갱신합니다.');setError('');try{const result=await request('/api/agent-builder/source_upload',{id:selected.id,fileName:file.name,data:await asBase64(file)});setSource(result.source);setScheduleNotice('소스 버전 '+result.source.version+' 저장 · 다음 실행부터 반영됩니다.');}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');if(sourceInput.current)sourceInput.current.value='';}}
- async function toggleSchedule(){if(!selected||!schedule||inFlight.current)return;inFlight.current=true;setBusy('예약 상태를 저장합니다.');setError('');try{const result=await request('/api/agent-builder/schedule',{id:selected.id,active:!schedule.active});setSchedule(result.schedule);setScheduleNotice(result.schedule.active?'서버가 켜져 있는 동안 정해진 시간에 실행합니다.':'다음 예약 실행을 중지했습니다.');}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}}
+ },[selected?.id,refreshRuns,busy,testRun?.id,queuedSourceRuns]);
+ async function uploadSource(file:File){if(!selected||inFlight.current)return;if(file.size>8*1024*1024){setError('자료는 8MB 이하로 연결하세요.');return;}inFlight.current=true;setBusy('다음 실행에 사용할 데이터 소스를 갱신합니다.');setError('');try{const result=await request('/api/agent-builder/source_upload',{id:selected.id,fileName:file.name,data:await asBase64(file)});setSource(result.source);setScheduleNotice('소스 버전 '+result.source.version+' 저장 · 다음 실행부터 반영됩니다.');}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');if(sourceInput.current)sourceInput.current.value='';}}
+
  async function testSchedule(){if(!selected||inFlight.current)return;inFlight.current=true;setBusy('시험 예약을 등록합니다.');setError('');try{const result=await request('/api/agent-builder/schedule_test',{id:selected.id});setJobs(prior=>[{...result.job,status:'queued'},...prior]);setScheduleNotice('15초 후 시험 예약을 등록했습니다. 서버 타이머가 실행하며 결과가 자동 갱신됩니다.');}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}}
  async function cancelSchedule(jobId:string){if(!selected||inFlight.current)return;inFlight.current=true;setBusy('시험 예약을 취소합니다.');setError('');try{const result=await request('/api/agent-builder/schedule_cancel',{id:selected.id,jobId});setJobs(prior=>prior.map(j=>j.id===jobId?result.job:j));setScheduleNotice('시험 예약을 취소했습니다.');}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}}
- async function uploadRun(file:File){if(!selected||inFlight.current)return;if(runFiles.length>=10){setError('실행 자료는 최대 10개입니다.');return;}inFlight.current=true;setBusy('이번 실행 자료를 읽고 있습니다.');setError('');try{const result=await request('/api/agent-builder/run_upload',{id:selected.id,fileName:file.name,data:await asBase64(file)});setRunFiles(prior=>[...prior,result.asset]);}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');if(runFileInput.current)runFileInput.current.value='';}}
- async function resumeRun(){if(!testRun||inFlight.current||!testText.trim())return;inFlight.current=true;setBusy('확인 답변으로 같은 실행을 이어갑니다.');setError('');try{const result=await request('/api/agent-builder/resume_run',{id:testRun.id,content:testText});setTestRun(result);setHistory(prior=>[result,...prior.filter(r=>r.id!==result.id)]);requestAnimationFrame(()=>resultPanel.current?.scrollIntoView({behavior:'smooth',block:'start'}));if(result.question)setTestText('');}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}}
+ async function uploadRun(file:File){if(!selected||inFlight.current)return;if(file.size>8*1024*1024){setError('자료는 8MB 이하로 연결하세요.');return;}if(runFiles.length>=10){setError('실행 자료는 최대 10개입니다.');return;}inFlight.current=true;setBusy('이번 실행 자료를 읽고 있습니다.');setError('');try{const result=await request('/api/agent-builder/run_upload',{id:selected.id,fileName:file.name,data:await asBase64(file)});setRunFiles(prior=>[...prior,result.asset]);}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');if(runFileInput.current)runFileInput.current.value='';}}
+ async function resumeRun(){if(!testRun||inFlight.current||!testText.trim())return;inFlight.current=true;setBusy('확인 답변으로 같은 실행을 이어갑니다.');setError('');try{const result=await request('/api/agent-builder/resume_run',{id:testRun.id,content:testText});setTestRun(result);setHistory(prior=>[result,...prior.filter(r=>r.id!==result.id)]);requestAnimationFrame(()=>resultPanel.current?.scrollIntoView({behavior:'smooth',block:'start'}));setTestText('');}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}}
+ async function selectRun(id:string){
+  if(inFlight.current)return;
+   setSelectedNodeId(null);
+  setQueuedSourceRuns([]);
+  const token=generation.current,requestId=++runDetailRequest.current;
+  pinnedRun.current=true;setTestRun(history.find(r=>r.id===id)||null);
+  const current=()=>token===generation.current&&requestId===runDetailRequest.current&&pinnedRun.current&&!inFlight.current;
+  try{const {run}=await request('/api/agent-builder/run?id='+encodeURIComponent(id));if(current())setTestRun(prior=>prior?.id===id?run:prior);}
+  catch(e){if(current())setError((e as Error).message);}
+ }
  async function decideReply(reviewId:string,decision:'approve'|'reject',editedReply:string){
   if(!testRun||inFlight.current)return;inFlight.current=true;setBusy('응대 결정과 최종 문장을 저장합니다.');setError('');
   try{const result=await request('/api/agent-builder/review_decision',{id:testRun.id,reviewId,decision,editedReply});setTestRun(result);setHistory(prior=>prior.map(r=>r.id===result.id?result:r));}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}
  }
- async function retryRun(){if(!testRun||inFlight.current)return;inFlight.current=true;setBusy('저장된 결과로 실패한 단계부터 재시도합니다.');setError('');try{const result=await request('/api/agent-builder/retry_run',{id:testRun.id});setTestRun(result);setHistory(prior=>prior.map(r=>r.id===result.id?result:r));}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}}
- useEffect(()=>{const id=new URLSearchParams(location.search).get('service')||localStorage.getItem('a4b-selected-agent');if(!id||localStorage.getItem('a4b-builder-session'))return;let cancelled=false;request('/api/agent-builder/agent?id='+encodeURIComponent(id)).then(result=>{if(cancelled)return;setSelected(result.agent);setAgentResources(result.resources);setSchedule(result.schedule);setSource(result.source);setJobs(result.jobs||[]);setHistory(result.tests||[]);setTestRun(result.tests[0]||null);}).catch(()=>localStorage.removeItem('a4b-selected-agent'));return()=>{cancelled=true;};},[]);
- async function connect(event:FormEvent){event.preventDefault();if(connectionBusy)return;setConnectionBusy(true);setConnectionError('');try{await request('/api/credentials',{name:connectionName,provider:'openai',data:{apiKey}});await refresh();setApiKey('');setConnection(false);}catch(e){setConnectionError((e as Error).message);}finally{setConnectionBusy(false);}}
+ async function retryRun(){if(selected?.deleted_at||!testRun||inFlight.current)return;inFlight.current=true;setBusy('저장된 결과로 실패한 단계부터 재시도합니다.');setError('');try{const result=await request('/api/agent-builder/retry_run',{id:testRun.id});setTestRun(result);setHistory(prior=>prior.map(r=>r.id===result.id?result:r));}catch(e){setError((e as Error).message);}finally{inFlight.current=false;setBusy('');}}
+
+ function canLeave(){if(inFlight.current||recovery?.running||libraryBusy)return false;return !(text.trim()||testText.trim()||replyDraft.trim()||runFiles.length||chosenRefs.length||libraryDirty||scheduleSourceDirty||scheduleSettingsDirty||clarificationDirty)||window.confirm('아직 보내지 않은 입력 또는 작업 선택이 있습니다. 이 화면을 나가면 입력이 사라집니다. 이동할까요?');}
+
+ useEffect(()=>{onCanLeaveChange?.(canLeave);});
+ function startFreshDesign(){if(onNewWorkflow)onNewWorkflow();else reset();}
+ function openDesignHome(){
+  if(screen==='workflow'&&!selected)return;
+  if(canLeave())startFreshDesign();
+ }
+ function leave(next:'home'|'workflows'|'schedules'|'history'|'assets'|'connections'|'monitoring'){if(canLeave())onNavigate?.(next);}
+ useEffect(()=>{
+  if(!(text.trim()||testText.trim()||replyDraft.trim()||runFiles.length||chosenRefs.length||libraryDirty||scheduleSourceDirty||scheduleSettingsDirty||clarificationDirty))return;
+  const beforeUnload=(event:BeforeUnloadEvent)=>{event.preventDefault();event.returnValue='';};
+  window.addEventListener('beforeunload',beforeUnload);return()=>window.removeEventListener('beforeunload',beforeUnload);
+ },[text,testText,replyDraft,runFiles.length,chosenRefs.length,libraryDirty,scheduleSourceDirty,scheduleSettingsDirty,clarificationDirty]);
+
+ // Stored failures can outlive a later clarification; attachment recovery needs an explicit marker and no open questions.
+ // Read-time projections are recomputed on every snapshot and are current in any status.
+ const attachmentRecovery=session?.status==='needs_clarification'&&!session.pending_questions?.length&&!session.draft?.questions.length
+  ?[session.requirement_failure,session.system_failure].find(failure=>failure?.recovery_pending===true&&failure.retryable):undefined;
+ const generationFailure=session?.status==='validation_failed'?(session.requirement_failure||session.system_failure)
+  :session?.requirement_failure&&PROJECTED_FAILURES.has(session.requirement_failure.kind||'')?session.requirement_failure:attachmentRecovery;
  const draft=selected?.config||session?.draft,resources=selected?(source?[source.asset,...agentResources.filter(r=>r.kind==='document')]:agentResources):session?.resources||[],ready=session?.status==='ready',saved=!!selected||session?.status==='saved';
  const collecting=session?.status==='needs_clarification'&&!draft?.workflow&&!!draft?.questions.length&&!draft?.tool_ids.length;
- const currentModel=selected?.model||session?.model||model;
+ const lastAssistant = session?.messages.map(message => message.role).lastIndexOf('assistant');
+ const receiptQuestion = !saved&&!generationFailure ? session?.pending_questions?.find(q => q.action?.type === 'attach_receipt' || q.action?.type === 'select_fields') : undefined;
+ const clarificationQuestions:ClarificationQuestionData[]=saved||receiptQuestion||generationFailure?[]:session?.pending_questions?.length
+  ? session.pending_questions.map(question=>{const index=session.draft?.questions.indexOf(question.text)??-1;return {...question,response:question.response||session.draft?.question_responses?.[index]||undefined};})
+  : (session?.draft?.questions||[]).map((question,index)=>({text:question,options:session?.draft?.question_options?.[index],response:session?.draft?.question_responses?.[index]||undefined}));
+  const slackChannelQuestion=clarificationQuestions.find(question=>question.key==='slack.channel_id'||/(?:Slack|슬랙).{0,20}채널/i.test(question.text));
+  const documentTableQuestionId=slackChannelQuestion?undefined:clarificationQuestions.find(question=>question.key==='document.fields')?.id;
+ // Only draw the version that actually ran when browsing history.
+ const runWorkflow = testRun?.config_snapshot && 'workflow' in testRun.config_snapshot
+  ? testRun.config_snapshot.workflow
+  : !testRun || selected?.version === testRun.agent_version ? selected?.config.workflow : undefined;
+ const resultFile = testRun && (testRun.artifact || testRun.report_path) ? {
+  ...testRun.artifact, name:suggestedRunFilename(testRun.artifact?.name || testRun.report_path!, testRun.config_snapshot?.name || selected?.config.name)
+ } : null;
+ const unverifiedFields = [...new Set((testRun?.rows || [])
+  .filter(row => row.status === 'not_found_or_unverified' && typeof row.field === 'string')
+  .map(row => String(row.field)))];
  const reviewCapable=!!selected&&usesTool(selected,'reply_review');
- const selectedNode=draft?.workflow?.nodes.find(n=>n.id===selectedNodeId)||null;
+ useEffect(()=>{setHighlightedNodeId(null);setSelectedNodeId(null);},[screen,selected?.id,session?.id]);
+ const inspectedWorkflow=screen==='workflow'?draft?.workflow:runWorkflow;
+ const inspectedNode=inspectedWorkflow?.nodes.find(node=>node.id===selectedNodeId)||null;
+ const canModifyInspectedNode=!selected?.deleted_at&&!busy&&!recovery&&!libraryBusy&&(screen==='workflow'?!!selected||!!session&&!saved
+  : !!selected&&(!testRun||testRun.agent_version===selected.version));
+ function modifyInspectedNode(nodeEdit:NodeEditRequest){
+  const {request}=nodeEdit;
+  if(request.length>4000){setError('변경 요청이 너무 깁니다. 값을 줄여 다시 시도해주세요.');return;}
+  if(selected){pendingNodeEdit.current=nodeEdit.changes.length?nodeEdit:null;void edit(request);return;}
+  const next=text.trim()?text.trimEnd()+'\n'+request:request;
+  if(next.length>4000){setError('대화 입력은 4,000자까지 가능합니다. 기존 입력을 줄인 뒤 다시 시도해주세요.');return;}
+  pendingNodeEdit.current=next===request&&nodeEdit.changes.length?nodeEdit:null;
+  setText(next);
+  setConversationCollapsed(false);
+  setSelectedNodeId(null);
+  if(window.innerWidth<=900)showEditorPanel('conversation');
+  requestAnimationFrame(()=>input.current?.focus({preventScroll:true}));
+ }
+ useEffect(()=>{
+  if(screen!=='workflow'||!editorGrid.current)return;
+  const grid=editorGrid.current;
+  const fit=()=>{
+   const available=Math.max(260,Math.min(900,window.innerHeight-Math.max(0,grid.getBoundingClientRect().top)-20));
+   const height=available+'px';
+   if(grid.style.getPropertyValue('--as-editor-height')!==height)grid.style.setProperty('--as-editor-height',height);
+  };
+  fit();
+  const observer=new ResizeObserver(fit);
+  if(grid.parentElement)observer.observe(grid.parentElement);
+  window.addEventListener('resize',fit);
+  return()=>{observer.disconnect();window.removeEventListener('resize',fit);};
+ },[screen,loading,error,busy,selected?.id,session?.base_version]);
+ const panelLabels = [
+  ['conversation', selected ? '설계 요약' : '업무 대화'],
+  ['canvas', '처리 흐름'],
+  ['settings', '설정'],
+ ] as const;
+ const runRequestField=<label className="as-field">{testRun?.question?'확인 질문에 답변':reviewCapable?(requestRequired?'고객 문의':'고객 문의 (선택 · 표의 문의 열 사용)'):requestRequired?'실행 요청':'추가 요청 (선택)'}<textarea placeholder={testRun?.question?"확인 질문에 답변하세요.":requestRequired?"저장한 워크플로우에 맡길 요청이나 질문을 입력하세요.":"비워 두면 저장한 설정으로 실행합니다."} data-tour="run-input" value={testText} onChange={e=>setTestText(e.target.value)} maxLength={4000} disabled={!!busy||!!recovery||libraryBusy}/>{requestRequired&&!testRun?.question&&<small>이 워크플로우는 이번에 처리할 {reviewCapable?'고객 문의':'질문이나 요청'}가 필요합니다.</small>}</label>;
+ const runHistory=history.length>0&&<details className="as-run-history"><summary>실행 기록 ({history.length})</summary><select disabled={!!busy} aria-label="실행 기록 선택" value={testRun?.id||''} onChange={e=>void selectRun(e.target.value)}>{history.map(r=><option key={r.id} value={r.id}>{r.id.slice(0,8)} · {({succeeded:'완료',failed:'실패',running:'실행 중',needs_input:'답변 대기'} as Record<string,string>)[r.status]||r.status} · 설정 v{r.agent_version} · {r.trigger==='scheduled'?'정규 예약':r.trigger==='schedule_test'?'시험 예약':'지금 실행'}</option>)}</select><button disabled={!!busy} className="as-text-button" onClick={()=>{pinnedRun.current=false;setSelectedNodeId(null);setTestRun(history[0]);}}>최신 실행 보기</button></details>;
+ const pageNavigation=screen==='schedule'&&selected?<div className="workspace-context task-library-header"><div className="task-library-tabs schedule-detail-tabs"><span className="as-button schedule-detail-current" aria-current="page"><CalendarClock size={16} aria-hidden="true"/>관리</span></div></div>:<div className="workspace-context"><nav className="studio-tabs" aria-label="워크플로우 작업"><button aria-current={screen==='workflow'?'page':undefined} className={screen==='workflow'?'active':''} onClick={()=>switchScreen('workflow')} disabled={!!busy||!!recovery||libraryBusy}><WorkflowIcon size={16} aria-hidden="true"/>설계</button><button data-tour="run-tab" aria-current={screen==='run'?'page':undefined} className={screen==='run'?'active':''} onClick={()=>switchScreen('run')} disabled={!!busy||!!recovery||libraryBusy}><Play size={16} aria-hidden="true"/>실행</button>{selected&&<button aria-current={screen==='schedule'?'page':undefined} className={screen==='schedule'?'active':''} onClick={()=>switchScreen('schedule')} disabled={!!busy||!!recovery||libraryBusy}><CalendarClock size={16} aria-hidden="true"/>예약 관리</button>}</nav>{screen==='workflow'&&<button type="button" data-tour="create-workflow" className="as-button as-primary as-new-workflow" disabled={loading||!!busy||!!recovery||libraryBusy} onClick={()=>{if(canLeave())startFreshDesign();}}><Plus size={16}/>새 워크플로우</button>}</div>;
+
+ const errorNotice=error&&<div className="as-error as-global-error" role="alert"><AlertCircle size={17}/><span>{error}</span>{recovery&&<button type="button" className="as-button" disabled={!!busy} onClick={()=>void reloadConversation()}>대화 다시 불러오기</button>}{recovery&&!recovery.running&&<button type="button" className="as-button as-secondary" disabled={!!busy} onClick={()=>void resumeConversation()}>이 대화 이어가기</button>}<WorkspaceIconButton disabled={!!recovery} onClick={()=>setError('')} aria-label="오류 안내 닫기"><X size={16}/></WorkspaceIconButton></div>;
+
  return <div className={"as-app screen-"+screen+(selected?" has-service":"")}>
-  <header className="as-header"><button className="as-brand" onClick={reset} disabled={!!busy} title="새 워크플로우 만들기로 이동"><span className="as-brandmark"><Sparkles size={19}/></span>A4B<span className="as-brand-sub">Agent Studio</span></button><nav className="studio-tabs" aria-label="작업 화면"><button className={screen==='nodes'?'active':''} onClick={()=>go('nodes')} disabled={!!busy}>노드 만들기</button><button className={screen==='workflow'?'active':''} onClick={()=>go('workflow')} disabled={!!busy}>워크플로우 설계</button><button className={screen==='run'?'active':''} onClick={()=>go('run')} disabled={!!busy}>서비스 실행</button></nav><div className="as-header-actions"><button className="as-text-button" onClick={()=>setHelp(true)}><HelpCircle size={16}/>사용 안내</button><button className="as-text-button" onClick={()=>{setConnectionError('');setConnection(true);}}><KeyRound size={16}/>모델 연결</button></div></header>
-  <div className="as-shell"><aside className="as-sidebar"><button className="as-button as-primary as-new" onClick={reset} disabled={!!busy}><Plus size={17}/>새 워크플로우</button><div className="as-sidebar-label">내 워크플로우 <span>{agents.length}</span></div><nav aria-label="저장한 에이전트">{agents.map(a=><button key={a.id} disabled={!!busy} onClick={()=>void openAgent(a)} className={'as-agent-link '+(selected?.id===a.id?'active':'')}><span className="as-small-icon"><Sparkles size={16}/></span><span><strong>{a.config.name}</strong><small>버전 {a.version} · {a.config.tool_ids.length}개 도구</small></span></button>)}</nav>{!agents.length&&!loading&&<p className="as-sidebar-empty">업무를 설명하면 첫 에이전트를 만들 수 있습니다.</p>}<div className="as-sidebar-bottom"><span className="as-engine-dot"/>내 업무 자동화</div></aside>
-  {screen==='nodes'?<NodeLibrary nodes={library} defaults={presets} catalog={catalog} onSaved={refreshLibrary} onUse={n=>{reset();setChosenRefs([n.ref]);setChosenSnapshots([n]);go('workflow');}} onToolUse={t=>{reset();setText(t.name+' 기능을 사용하는 워크플로우를 만들어줘. ');go('workflow');}}/>:<main className="as-main"><div className="as-page-title"><div><p className="as-eyebrow">{selected?.config.schedule?'MY AUTOMATION':selected?'MY WORKFLOW':screen==='run'?'RUN SERVICE':'DESIGN WORKFLOW'}</p><h1>{selected?selected.config.name:session?.base_version?'대화로 에이전트 설정을 수정하세요.':screen==='run'?'실행할 서비스를 선택하세요.':'어떤 흐름을 만들까요?'}</h1><p>{selected?.config.schedule?'저장한 노드·처리 규칙을 서버에서 실행하는 자동화입니다.':selected?'저장한 지시사항·도구·자료로 동작하는 에이전트입니다.':screen==='run'?'저장한 워크플로우를 선택하고 실제 요청·파일로 실행합니다.':'맡길 일을 설명하고, 확인한 흐름을 저장해 직접 실행하세요.'}</p></div>{selected&&<button className="as-button" onClick={edit} disabled={!!busy}><Settings2 size={16}/>설정 수정</button>}</div>
-   <div className="as-progress" aria-label="에이전트 생성 진행"><span className={!draft?'current':'done'}><i>{draft?<Check size={12}/>:'1'}</i>업무 설명</span><span className={draft&&!saved?'current':saved?'done':''}><i>{saved?<Check size={12}/>:'2'}</i>설정 확인</span><span className={saved?'current':''}><i>3</i>저장 완료</span></div>
-   {screen==='run'&&!selected&&<div className="nl-empty"><h2>저장한 흐름으로 서비스를 실행합니다.</h2><p>{agents.length?'왼쪽 목록에서 실행할 서비스를 선택하세요.':'워크플로우 설계 화면에서 먼저 업무를 설명하고 저장하세요.'}</p><button className="as-button as-primary" onClick={()=>go('workflow')}>워크플로우 설계로 이동</button></div>}
-    {screen==='workflow'&&!selected&&!session&&<details className="nl-select"><summary>사용할 노드 직접 선택 · 최대 10개 · 선택하지 않으면 자동 구성</summary><div>{nodeChoices.map(n=><label key={n.ref}><input type="checkbox" checked={chosenRefs.includes(n.ref)} disabled={chosenRefs.length>=10&&!chosenRefs.includes(n.ref)} onChange={e=>chooseNode(n,e.target.checked)}/>{n.spec.name} <small>v{n.version} · {n.spec.kind==='agent'?'에이전트':'처리'}{library.some(latest=>latest.id===n.id&&latest.version>n.version)?' · 선택한 이전 버전':''}</small></label>)}</div></details>}
-    {screen==='workflow'&&!session&&chosenRefs.length>0&&<p className="nl-chosen">선택한 노드: {nodeChoices.filter(n=>chosenRefs.includes(n.ref)).map(n=>n.spec.name+' · v'+n.version).join(' / ')}</p>}{error&&<div className="as-error" role="alert"><AlertCircle size={17}/><span>{error}</span><button onClick={()=>setError('')} aria-label="오류 안내 닫기"><X size={16}/></button></div>}
-   {selected&&busy&&<div className="as-busy" role="status"><Loader2 size={17} className="as-spin"/>{busy}</div>}<div className="as-editor-grid"><section className="as-conversation" aria-label={screen==='workflow'?'워크플로우 설계 대화':'서비스 실행'}><div className="as-panel-header"><span><MessageSquare size={17}/>{screen==='workflow'?(selected?'설계 요약':'업무 설명'):selected?.config.schedule?'실행·예약':'요청·결과'}</span><small>{selected?'설정 버전 '+selected.version:session?'대화 자동 보존':'대화로 설정 만들기'}</small></div>
-    {selected&&screen==='workflow'&&<div className="nl-saved"><h2>저장한 설계</h2><p>{selected.config.purpose}</p><ol className="as-saved-requirements">{selected.config.requirements.map((r,i)=><li key={i}>{r.description}</li>)}</ol><p className="as-small-muted">노드를 눌러 설정과 입력 연결을 확인하세요. 변경하려면 위의 설정 수정을 누릅니다.</p><button className="as-button as-primary" onClick={()=>go('run')}>서비스 실행으로 이동</button></div>}
-    {selected?<div className="as-test-area"><div className="as-service-input"><div className="as-created"><CheckCircle2 size={20}/><div><h2>{schedule?"예약과 데이터 소스를 확인하세요.":"사용할 요청과 자료를 넣어보세요."}</h2><p>{schedule?"지금 실행 또는 시험 예약으로 보고서를 확인합니다.":"저장된 워크플로우로 실행하고 결과·근거·단계 기록을 확인합니다."}</p></div></div>{schedule&&<div className="as-schedule-card"><div className="as-flow-heading"><strong><CalendarClock size={17}/>예약 실행</strong><span className="as-status">{schedule.active?'활성':'중지'}</span></div><p>{schedule.spec.frequency==='daily'?'매일':'매주 '+['월','화','수','목','금','토','일'][schedule.spec.weekday||0]+'요일'} {String(schedule.spec.hour).padStart(2,'0')}:{String(schedule.spec.minute).padStart(2,'0')} · {schedule.spec.timezone}</p><small>{schedule.active?"다음 실행":"활성화 시 예정"}: {new Date(schedule.next_run_at).toLocaleString('ko-KR',{timeZone:schedule.spec.timezone||'Asia/Seoul'})}</small><div className="as-run-actions"><button className="as-button" onClick={toggleSchedule} disabled={!!busy||!source}>{schedule.active?'예약 중지':'예약 켜기'}</button><button className="as-button" onClick={testSchedule} disabled={!!busy||!source}>15초 후 시험 예약</button></div><div className="as-source-line"><div><strong>관리 데이터 소스</strong><p>{source?source.asset.name+' · 버전 '+source.version:'연결 필요'}</p></div><button className="as-button" onClick={()=>sourceInput.current?.click()} disabled={!!busy}><RefreshCw size={14}/>{source?'파일 갱신':'파일 연결'}</button></div>{scheduleNotice&&<p className="as-small-muted" role="status">{scheduleNotice}</p>}<small>현재는 이 PC의 서버에서 실행합니다. PC 또는 서버를 끄면 예약 실행도 멈춥니다.</small>{jobs.some(j=>['queued','running'].includes(j.status)||j.status==='failed'&&!j.run_id)&&<details className="as-evidence-list"><summary>예약 대기·관리 상태</summary>{jobs.filter(j=>['queued','running'].includes(j.status)||j.status==='failed'&&!j.run_id).slice(0,8).map(j=><p key={j.id}>{j.kind==='schedule_test'?'시험 예약':'정규 예약'} · {new Date(j.due_at).toLocaleString('ko-KR')} · {({queued:'대기',running:'실행 중',succeeded:'완료',failed:'실패'} as Record<string,string>)[j.status]||j.status}{(j as any).retry_count?' · 재시도 '+(j as any).retry_count+'회':''}{j.error?' · '+j.error:''}{j.kind==='schedule_test'&&j.status==='queued'&&<button className="as-text-button" disabled={!!busy} onClick={()=>void cancelSchedule(j.id)}>시험 예약 취소</button>}</p>)}</details>}</div>}{!schedule&&<><div className="as-run-files"><button className="as-button" onClick={()=>runFileInput.current?.click()} disabled={!!busy}><Paperclip size={15}/>이번 실행 자료 추가</button><small>새 자료를 넣으면 이번 실행에 사용합니다.</small>{runFiles.map(f=><div key={f.id}><span>{f.name}</span><button disabled={!!busy} onClick={()=>setRunFiles(prior=>prior.filter(x=>x.id!==f.id))} aria-label={f.name+' 제거'}><X size={14}/></button></div>)}</div><label className="as-field">{testRun?.question?'확인 질문에 답변':reviewCapable?'고객 문의 (표 검수는 파일의 문의 열 사용)':'실행 요청'}<textarea placeholder={testRun?.question?"확인 질문에 답변하세요.":"저장한 에이전트에 맡길 요청이나 질문을 입력하세요."} value={testText} onChange={e=>setTestText(e.target.value)} maxLength={4000} disabled={!!busy}/></label>{reviewCapable&&<label className="as-field">검수할 응대 초안<textarea aria-label="검수할 응대 초안" placeholder="이미 작성한 초안을 붙여 넣으세요. 앞 노드에서 초안을 생성하거나 표로 검수할 때는 비워 두세요." value={replyDraft} onChange={e=>setReplyDraft(e.target.value)} maxLength={12000} disabled={!!busy}/></label>}</>}<div className="as-run-actions">{testRun?.question&&<button className="as-button as-primary" onClick={resumeRun} disabled={!!busy||!testText.trim()}>답변하고 이어 실행</button>}<button className={"as-button "+(!testRun?.question?"as-primary":"")} onClick={runTest} disabled={!!busy||(!testText.trim()&&!schedule&&!usesTool(selected,'read_table'))}>{testRun?.question?"새 실행 시작":schedule?"지금 실행":"에이전트 실행"}</button></div>{reviewCapable&&<a className="as-button" href={'/api/agent-builder/approved_replies?id='+encodeURIComponent(selected.id)}>승인된 응대 CSV 다운로드</a>}{history.length>0&&<details className="as-run-history"><summary>실행 기록 ({history.length})</summary><select aria-label="실행 기록 선택" value={testRun?.id||''} onChange={e=>{pinnedRun.current=true;const id=e.target.value;setTestRun(history.find(r=>r.id===id)||null);void request('/api/agent-builder/run?id='+encodeURIComponent(id)).then(({run})=>setTestRun(prior=>prior?.id===id?run:prior)).catch(error=>setError(error.message));}}>{history.map(r=><option key={r.id} value={r.id}>{r.id.slice(0,8)} · {({succeeded:'완료',failed:'실패',running:'실행 중',needs_input:'답변 대기'} as Record<string,string>)[r.status]||r.status} · 설정 v{r.agent_version} · {r.trigger==='scheduled'?'정규 예약':r.trigger==='schedule_test'?'시험 예약':'지금 실행'}</option>)}</select><button className="as-text-button" onClick={()=>{pinnedRun.current=false;setTestRun(history[0]);}}>최신 실행 보기</button></details>}</div>{!testRun&&<div className="as-service-empty"><FileOutput size={30}/><h2>실행 결과</h2><p>요청과 자료를 넣어 실행하면 결과와 단계 기록이 여기에 표시됩니다.</p></div>}{testRun&&<div ref={resultPanel} className="as-test-result"><div className="as-result-title"><strong>{testRun.status==='succeeded'?(testRun.reviews?.length?(testRun.approval_status==='pending'?'검수 완료 · 승인 대기':'검수 완료 · 운영자 결정 저장됨'):'워크플로우 실행 완료'):testRun.status==='failed'?'실행 실패':testRun.status==='running'?'실행 중':'추가 정보 확인 필요'}</strong><span>설정 v{testRun.agent_version} · 실행 {testRun.id.slice(0,8)}</span></div><p className="as-preserve">{testRun.error||testRun.answer}</p>{testRun.source_version&&<p className="as-small-muted">이 실행에 사용한 소스: v{testRun.source_version}</p>}{testRun.report_path&&<p className="as-small-muted">서버 보고서: {testRun.report_path} · {testRun.trigger==='schedule_test'?'시험 예약':testRun.trigger==='scheduled'?'정규 예약':'지금 실행'}</p>}{testRun.rows?.length>0&&<div className="as-table-scroll"><table><thead><tr>{Object.keys(testRun.rows[0]).map(k=><th key={k}>{("evidence" in testRun.rows[0]&&"field" in testRun.rows[0])?({file_name:"파일",field:"항목",value:"추출값",status:"확인 상태",evidence:"근거"} as Record<string,string>)[k]||k:k}</th>)}</tr></thead><tbody>{testRun.rows.slice(0,10).map((r,i)=><tr key={i}>{Object.keys(testRun.rows[0]).map(k=><td key={k}>{k==='evidence'&&r[k]?<button className="as-text-button" onClick={()=>setEvidence(r[k] as any)}>원문 확인</button>:typeof r[k]==='object'&&r[k]!==null?JSON.stringify(r[k]):k==='status'?({verified:'원문 일치',not_found_or_unverified:'누락 또는 근거 미확인'} as Record<string,string>)[String(r[k])]||String(r[k]):String(r[k]??'')}</td>)}</tr>)}</tbody></table><small>전체 {testRun.rows.length}행 · 최대 10행 미리보기</small></div>}{testRun.report_path?<a className="as-button" href={"/api/agent-builder/report?id="+encodeURIComponent(testRun.id)}><Download size={16}/>서버 보고서 다운로드</a>:testRun.artifact&&<button className="as-button" onClick={()=>download(testRun.artifact!)}><Download size={16}/>결과 다운로드</button>}<details className="as-evidence-list"><summary>실행에 사용한 근거 확인 ({testRun.evidence?.length||0})</summary>{testRun.evidence?.map((e,i)=><button key={i} className="as-resource" onClick={()=>setEvidence(e)}>{e.file_name}{e.page?` · ${e.page}쪽`:""}<span>원문 보기</span></button>)}</details>{testRun.status==='failed'&&<button className="as-button" disabled={!!busy} onClick={retryRun}>실패 단계부터 재시도</button>}{!!testRun.reviews?.length&&<ReplyReviewPanel reviews={testRun.reviews} runId={testRun.id} disabled={!!busy} canDecide={testRun.status==='succeeded'} onDecision={decideReply}/>}{(testRun.attempts?.length||0)>1&&<details className="as-evidence-list"><summary>실행·재개 이력 ({testRun.attempts!.length}회)</summary>{testRun.attempts!.map(a=><p key={a.number}>{a.number}차 · {({succeeded:'성공',failed:'실패',running:'실행 중',needs_input:'응답 대기'} as Record<string,string>)[a.status]||a.status}{a.error?' · '+a.error:''}</p>)}</details>}<Trace steps={testRun.steps}/></div>}</div>:<><div className="as-messages">{loading?<div className="as-loading"><Loader2 className="as-spin"/>저장한 대화를 확인하고 있습니다.</div>:!session?.messages.length?<div className="as-welcome"><span className="as-welcome-icon"><Sparkles size={27}/></span><h2>어떤 일을 맡기고 싶으세요?</h2><p>맡길 업무와 원하는 결과를 편하게 설명하세요.<br/>부족한 조건은 제가 질문하겠습니다.</p>{samples.length>0&&<div className="as-examples">{samples.map(s=><button key={s.label} onClick={()=>{setText(s.text);input.current?.focus();}}><strong>{s.label}<ArrowUp size={14}/></strong><span>{s.text.slice(0,75)}…</span></button>)}</div>}<p className="as-scope">자료와 업무 설명으로 구성한 초안을 확인하고 저장하세요.</p></div>:session.messages.map((m,i)=><div key={i} className={'as-message '+m.role}><span className="as-message-label">{m.role==='user'?'나':'A4B'}</span><p>{m.content}</p></div>)}{!selected&&session?.draft?.questions.map((q,i)=>session.draft?.question_options?.[i]?.length?<div key={i} className="as-choice-group"><p>{q}</p>{session.draft.question_options[i].map((option,j)=><button key={j} disabled={!!busy} onClick={()=>{setText(prior=>(prior?prior+"\n":"")+q+" → "+option);input.current?.focus();}}>{option}</button>)}</div>:null)}{busy&&<div className="as-busy" role="status"><Loader2 size={17} className="as-spin"/>{busy}</div>}<div ref={end}/></div><form className="as-composer" onSubmit={send}><textarea ref={input} placeholder={collecting?'확인 질문에 답해주세요.':draft?'추가하거나 바꿀 조건을 설명하세요.':'예: 여러 자료에서 필요한 내용을 찾아 정리하는 기능이 필요해요.'} value={text} onChange={e=>setText(e.target.value)} maxLength={4000} disabled={!!busy||saved} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();void send();}}}/><div className="as-composer-footer"><button type="button" className="as-text-button" onClick={()=>fileInput.current?.click()} disabled={!!busy||saved||!credentialId&&!session}><Paperclip size={16}/>자료 연결</button><small>Enter 전송 · Shift+Enter 줄바꿈</small><button type="submit" className="as-send" disabled={!!busy||!text.trim()||saved||!credentialId&&!session} aria-label="업무 설명 보내기"><ArrowUp size={19}/></button></div></form></>}
+  {filePicker && !saved && screen==='workflow' && <DesignFolderPicker picker={{...filePicker,apply:(files,folder)=>{setFilePicker(null);filePicker.apply(files,folder);}}} connected={resources} close={()=>setFilePicker(null)}/>}
+  {attachMode && !saved && screen==='workflow' && <AttachUploadDialog mode={attachMode} onClose={()=>setAttachMode(null)}
+    connected={resources.map(r=>r.id)} formats={receiptQuestion ? receiptFileTypes : undefined}
+     onFolder={receiptQuestion?undefined:()=>{setAttachMode(null);setFilePicker({hint:'',apply:files=>{void attachSelectedDesignFiles(files);}});}}
+    onLibrary={()=>setAttachMode('library')} onNew={()=>{setAttachMode(null);fileInput.current?.click();}}
+    onSelect={id=>{setAttachMode(null);void attachResource(id);}}/>}
+  <WorkspaceHeader onHome={()=>leave('home')} disabled={loading||!!busy||!!recovery||libraryBusy}/>
+
+  {screen==='nodes'&&errorNotice}
+  <div className="as-shell"><WorkspaceSidebar active={screen==='nodes'?'workflows':screen==='schedule'?'schedules':'workflow'} disabled={!!busy||!!recovery?.running||libraryBusy} help={<WorkspaceHelp currentTourPanel={editorPanel} onTourPanelChange={showEditorPanel} deferAutoStart={loading||!!busy||!!recovery||libraryBusy}/>} onNavigate={next=>{if(next==='workflow')openDesignHome();else leave(next);}}></WorkspaceSidebar>
+  <div style={{display:screen==='nodes'?'contents':'none'}}>{libraryVisited&&<NodeLibrary loadingView={screen==='nodes'?<PageTransition active={loading}/>:undefined} loading={loading} unavailable={initialLoadFailed} header={<TaskLibraryHeader active="nodes" disabled={!!busy||!!recovery||libraryBusy} onNavigate={next=>{if(next==='workflows')leave(next);}} actions={window.history.state?.returnToDesign&&<button type="button" className="as-text-button" disabled={!!busy||!!recovery||libraryBusy} onClick={()=>switchScreen('workflow')}><ArrowLeft size={15}/>설계로 돌아가기</button>}/>} onDirtyChange={setLibraryDirty} onBusyChange={setLibraryBusy} nodes={library} defaults={presets} catalog={catalog} onSaved={refreshLibrary} onUse={n=>{if(!canLeave())return;reset();setChosenRefs([n.ref]);setChosenSnapshots([n]);go('workflow');}} onToolUse={t=>{if(!canLeave())return;reset();setText(t.name+' 기능을 사용하는 워크플로우를 만들어줘. ');go('workflow');}}/>}</div>{screen!=='nodes'&&<main className="as-main"><PageTransition active={loading}/>{errorNotice}<div className="as-page-title"><div className="workflow-title-actions"><WorkspacePageTitle icon={WorkflowIcon}>{selected?selected.config.name:session?.base_version?'워크플로우 수정':screen==='run'?'워크플로우 실행':screen==='schedule'?'예약 관리':'워크플로우 설계'}</WorkspacePageTitle>{selected&&!selected.deleted_at&&(screen==='workflow'||screen==='schedule')&&<EditIconButton type="button" aria-label="워크플로우 이름 변경" title="워크플로우 이름 변경" disabled={!!busy||!!recovery||libraryBusy} onClick={()=>setRenaming(selected)}/>}</div>{selected&&!selected.deleted_at&&<button data-tour="edit-workflow" className="as-button as-secondary" onClick={()=>void edit()} disabled={!!busy||!!recovery||libraryBusy}><Settings2 size={16}/>설정 수정</button>}{screen==='workflow'&&!saved&&<div className="as-design-actions">
+     <button type="button" className="as-button as-secondary" onClick={()=>go('nodes',true)} disabled={loading||!!busy||!!recovery||libraryBusy}>작업 찾아보기</button>
+     <button className="as-button as-primary" onClick={reviewSave} disabled={!ready||!!busy||!!recovery||libraryBusy}><Check size={17}/>{session?.base_version?'새 버전 저장':'저장'}</button>
+    </div>}</div>{pageNavigation}{(screen!=='schedule'||!selected)&&agents.length>0&&<details className="as-workflow-switcher"><summary>워크플로우 선택</summary><nav data-tour="saved-workflows" aria-label="저장한 워크플로우">{agents.map(a=><button key={a.id} disabled={!!busy||!!recovery||libraryBusy} onClick={()=>{if(canLeave())void openAgent(a);}} className={'as-agent-link '+(selected?.id===a.id?'active':'')}><span className="as-small-icon"><WorkflowIcon size={16}/></span><span><strong>{a.config.name}</strong><small>버전 {a.version} · {a.config.tool_ids.length}개 도구</small></span></button>)}</nav></details>}
+
+   {renaming&&<WorkflowRenameDialog name={renaming.config.name} onClose={()=>setRenaming(null)} onSave={async name=>{
+    const updated=await renameWorkflow(renaming,name);
+    setSelected(current=>current?.id===updated.id?{...current,...updated}:current);
+    setAgents(current=>current.map(agent=>agent.id===updated.id?updated:agent));
+    setSchedule(current=>current?.agent_version===renaming.version?{...current,agent_version:updated.version}:current);
+   }}/>}
+   {screen==='workflow'&&!saved&&<div className="as-progress"  aria-label="설계 진행">
+    <span className={draft?'done':'current'}><i>{draft?<Check size={12}/>:'1'}</i>업무 설명</span>
+    <span className={draft?'current':''}><i>2</i>설정 확인</span>
+    <span><i>3</i>저장</span>
+   </div>}
+   {(screen==='run'||screen==='schedule')&&!selected&&loading&&<div className="as-loading" role="status"><Loader2 className="as-spin"/>저장한 워크플로우를 불러오고 있습니다.</div>}{(screen==='run'||screen==='schedule')&&!selected&&!loading&&!busy&&!initialLoadFailed&&<div className="nl-empty"><h2>저장한 워크플로우가 필요합니다.</h2><p>{agents.length?'상단에서 실행할 워크플로우를 선택하세요.':'워크플로우 설계 화면에서 먼저 업무를 설명하고 저장하세요.'}</p>{session?.status==='saved'&&session.saved_agent_id?<button className="as-button as-primary" disabled={!!busy||!!recovery||libraryBusy} onClick={()=>void openAgent({id:session.saved_agent_id!})}>저장한 워크플로우 다시 불러오기</button>:<button data-tour="create-workflow" className="as-button as-primary" onClick={()=>switchScreen('workflow')}>워크플로우 설계로 이동</button>}</div>}
+
+    {screen==='workflow'&&!session&&chosenRefs.length>0&&<p className="nl-chosen">선택한 작업: {nodeChoices.filter(n=>chosenRefs.includes(n.ref)).map(n=>n.spec.name+' · v'+n.version).join(' / ')}</p>}
+   {busy&&(screen!=='workflow'||selected)&&<div className="as-busy as-operation-progress" role="status"><Loader2 size={17} className="as-spin" aria-hidden="true"/><span>{busy}</span></div>}{screen==='workflow'&&<nav className="as-panel-switcher" aria-label={selected?'설계 보기':'편집 영역'}>
+    {panelLabels.map(([id,label])=><button type="button" key={id} aria-pressed={editorPanel===id} onClick={()=>showEditorPanel(id)}>{label}</button>)}
+   </nav>}
+   <div ref={editorGrid} className="as-editor-grid" data-chat-collapsed={conversationCollapsed} data-panel={editorPanel}>
+   <section data-tour={screen==='run'?'run-area':'conversation'} className={'as-conversation'+(selected&&screen==='workflow'?' as-saved-design':'')} aria-label={screen==='workflow'?(selected?'설계 요약':'워크플로우 설계 대화'):'서비스 실행'}>
+    <div className="as-panel-header"><span><MessageSquare size={17}/>{screen==='workflow'?(selected?'설계 요약':'업무 대화'):screen==='schedule'?'예약 관리':'실행 · 결과'}</span><small>{selected?'설정 버전 '+selected.version:session?'대화 자동 보존':'대화로 설정 만들기'}</small></div>
+    {selected&&screen==='workflow'&&<div className="as-design-summary">
+      <div><h2>업무 목적</h2><p>{selected.config.purpose}</p></div>
+      {selected.config.requirements.length>0&&<div>
+        <h2>업무 조건</h2>
+        <ul>{selected.config.requirements.map((requirement,index)=><li key={index}>{requirement.description}</li>)}</ul>
+      </div>}
+    </div>}
+    {selected&&slackRequired&&!slackConnected&&<div className="as-small-muted" role="status"><p>{slackConnection?.agentId===selected.id?'Slack 계정을 연결한 뒤 실행하거나 예약할 수 있어요.':'Slack 연결 상태를 확인하고 있어요.'}</p>{slackConnection?.agentId===selected.id&&<button type="button" className="as-text-button" onClick={()=>leave('connections')}>서비스 연결 열기</button>}</div>}
+    {selected?<div className="as-test-area">{selected.deleted_at?<div className="as-deleted-history"><p className="as-small-muted" role="status">삭제된 워크플로우입니다. 기존 실행 기록만 확인할 수 있습니다.</p>{runHistory}</div>:<div className="as-service-input"><div className="as-created"><CheckCircle2 size={20}/><div><h2>{screen==='schedule'?(schedule?"예약 설정과 사용할 자료를 확인하세요.":"이 워크플로우에 예약을 추가하세요."):requestRequired?"실행 요청과 자료":"이번 실행 자료"}</h2>{screen==='schedule'&&<p>일정은 업무 흐름과 별도로 저장됩니다. 예약을 해제해도 직접 실행할 수 있습니다.</p>}</div></div>{screen==='schedule'&&<ScheduleSettings onDirtyChange={setScheduleSettingsDirty} workflowId={selected.id} workflowVersion={selected.version} schedule={schedule} activationDisabled={!scheduleSourceReady||scheduleRequestRequired} disabled={!!busy||!!recovery||libraryBusy} onBusyChange={value=>{inFlight.current=value;setBusy(value?'예약 설정을 저장합니다.':'');}} onChange={async next=>{setSchedule(next as SavedSchedule|null);setQueuedSourceRuns([]);await refreshScheduleSource();}}/>}{screen==='schedule'&&schedule&&<div className="as-schedule-card"><div className="as-flow-heading"><strong><Database size={17}/>예약에 사용할 자료와 시험 실행</strong></div><div className="as-run-actions"><button className="as-button" onClick={testSchedule} disabled={!!busy||!!recovery||libraryBusy||!scheduleSourceReady}>15초 후 시험 예약</button></div>{gmailSchedule?<div className="as-schedule-gmail"><p className="as-small-muted">메일 조회 한도: 실행당 {gmailReadLimit(selected)||100}건. 조회한 메일을 여러 묶음으로 요약하며, 한도를 넘으면 결과에 표시합니다.</p><GmailConnection disabled={!!busy||!!recovery||libraryBusy} variant="card" onStatusChange={setGmailConnected}/></div>:runInputs.library_source?<p className="as-small-muted as-schedule-input-note">연결한 자료함의 설정에 따라 실행할 파일을 선택합니다.</p>:sourceFreeSchedule?<p className="as-small-muted as-schedule-input-note">저장한 설정과 연결된 서비스로 실행합니다.</p>:<div className="as-source-line"><div><strong>관리 데이터 소스</strong><p>{source?source.asset.name+' · 버전 '+source.version:'연결 필요'}</p></div><button className="as-button" onClick={()=>sourceInput.current?.click()} disabled={!!busy||!!recovery||libraryBusy}><RefreshCw size={14}/>{source?'파일 갱신':'파일 연결'}</button></div>}{librarySourceSettings} {scheduleNotice&&<p className="as-small-muted" role="status">{scheduleNotice}</p>}<small>현재는 이 PC의 서버에서 실행합니다. PC 또는 서버를 끄면 예약 실행도 멈춥니다.</small>{jobs.some(j=>['queued','running','skipped'].includes(j.status)||j.status==='failed'&&!j.run_id)&&<details className="as-evidence-list"><summary>예약 대기·관리 상태</summary>{jobs.filter(j=>['queued','running','skipped'].includes(j.status)||j.status==='failed'&&!j.run_id).slice(0,8).map(j=><p key={j.id}>{j.kind==='schedule_test'?'시험 예약':'정규 예약'} · {new Date(j.due_at).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'})} · {({queued:'대기',running:'실행 중',succeeded:'완료',failed:'실패',skipped:'대상 파일 없음'} as Record<string,string>)[j.status]||j.status}{(j as any).retry_count?' · 재시도 '+(j as any).retry_count+'회':''}{j.source_name?' · '+j.source_name:''}{j.error?' · '+j.error:''}{j.kind==='schedule_test'&&j.status==='queued'&&<button className="as-text-button" disabled={!!busy||!!recovery||libraryBusy} onClick={()=>void cancelSchedule(j.id)}>시험 예약 취소</button>}</p>)}</details>}</div>}{screen==='schedule'&&scheduleRequestRequired&&<p className="as-small-muted" role="status">자동 실행에 필요한 요청을 업무 흐름의 고정 설정으로 지정한 뒤 예약을 켜세요.</p>}{screen!=='schedule'&&gmailRequired&&<GmailConnection disabled={!!busy||!!recovery||libraryBusy} variant="card" onStatusChange={setGmailConnected}/>}{screen!=='schedule'&&<div className="as-run-files"><button className="as-button" onClick={()=>runFileInput.current?.click()} disabled={!!busy||!!recovery||libraryBusy}><Paperclip size={15}/>이번 실행 자료 추가</button><small>{fileHint}</small>{runFiles.map(f=><div key={f.id}><span>{f.name}</span><WorkspaceIconButton disabled={!!busy||!!recovery||libraryBusy} onClick={()=>setRunFiles(prior=>prior.filter(x=>x.id!==f.id))} aria-label={f.name+' 제거'}><X size={14}/></WorkspaceIconButton></div>)}</div>}{screen!=='schedule'&&(requestRequired||testRun?.question||reviewCapable)&&runRequestField}{screen!=='schedule'&&reviewCapable&&<label className="as-field">검수할 응대 초안<textarea aria-label="검수할 응대 초안" placeholder="이미 작성한 초안을 붙여 넣으세요. 앞 작업에서 초안을 생성하거나 표로 검수할 때는 비워 두세요." value={replyDraft} onChange={e=>setReplyDraft(e.target.value)} maxLength={12000} disabled={!!busy||!!recovery||libraryBusy}/></label>}<div className="as-run-actions">{screen!=='schedule'&&testRun?.question&&<button className="as-button as-primary" onClick={resumeRun} disabled={!!busy||!testText.trim()||(slackRequired&&!slackConnected)}>답변하고 이어 실행</button>}<button className={"as-button "+(!testRun?.question?"as-primary":"")} data-tour="run-submit" onClick={runTest} disabled={!!busy||!!recovery||libraryBusy||!canStartRun||screen==='schedule'&&!schedule}>{screen==='schedule'?"예약 자료로 지금 실행":testRun?.question?"새 실행 시작":"워크플로우 실행"}</button></div>{screen==='run'&&!requestRequired&&!testRun?.question&&!reviewCapable&&<RunRequestDetails key={selected.id} hasText={!!testText.trim()}>
+        <summary>추가 요청</summary>{runRequestField}
+       </RunRequestDetails>}{screen==='run'&&librarySourceSettings&&<details className="as-run-source-settings"><summary>{scheduleSourceDirty?'자료함 연결 설정 · 저장 필요':'자료함 연결 설정'}</summary>{librarySourceSettings}</details>}{reviewCapable&&<RunFileDownload file={{name:'승인된_응대.csv',mime:'text/csv'}} url={'/api/agent-builder/approved_replies?id='+encodeURIComponent(selected.id)} label="승인된 응대 CSV 다운로드"/>}{screen!=='schedule'&&scheduleNotice&&<p className="as-small-muted" role="status">{scheduleNotice}</p>}{runHistory}</div>}{!testRun&&runWorkflow&&<div className="as-test-result"><RunWorkflowDiagram workflow={runWorkflow} selectedNodeId={highlightedNodeId} onSelectNode={node=>{setHighlightedNodeId(node.id);setSelectedNodeId(null);}} onOpenNodeSettings={(node,trigger)=>{setNodeTrigger(trigger);setHighlightedNodeId(node.id);setSelectedNodeId(node.id);}}/></div>}{!testRun&&!runWorkflow&&<div className="as-service-empty"><FileOutput size={30}/><h2>실행 결과</h2><p>요청과 자료를 넣어 실행하면 결과와 단계 기록이 여기에 표시됩니다.</p></div>}{testRun&&<div data-tour="run-result" ref={resultPanel} className="as-test-result"><div className="as-result-title"><strong>{testRun.status==='succeeded'?(testRun.reviews?.length?(testRun.approval_status==='pending'?'검수 완료 · 승인 대기':'검수 완료 · 운영자 결정 저장됨'):'워크플로우 실행 완료'):testRun.status==='failed'?'실행 실패':testRun.status==='running'?'실행 중':'추가 정보 확인 필요'}</strong><span>설정 v{testRun.agent_version} · 실행 {testRun.id.slice(0,8)}</span></div>
+
+      {(testRun.error || testRun.answer) && (testRun.error
+       ? <p className="as-preserve">{testRun.error}</p>
+       : testRun.status==='succeeded'&&isGmailSlackSummaryWorkflow(runWorkflow)
+        ? <GmailSummaryResult answer={testRun.answer} workflow={runWorkflow}/>
+        : <RunAnswer text={testRun.answer}/>)}
+      {uncertainSlackDelivery&&<p role="alert" className="as-small-muted">Slack 채널에서 메시지를 확인한 뒤 필요하면 새 실행을 시작해주세요.</p>}
+      {resultFile && <div className="as-run-file-bar">
+        <div><small>{testRun.trigger==='schedule_test'?'시험 예약 · ':testRun.trigger==='scheduled'?'정규 예약 · ':''}결과 파일</small><strong>{resultFile.name}</strong></div>
+        <RunFileDownload key={testRun.id} file={resultFile}
+          url={testRun.report_path ? '/api/agent-builder/report?id='+encodeURIComponent(testRun.id) : undefined}/>
+      </div>}
+      <RunWorkflowDiagram workflow={runWorkflow} steps={testRun.steps} runStatus={testRun.status} waitingNodeId={testRun.question?.node_id} selectedNodeId={highlightedNodeId} onSelectNode={runWorkflow?node=>{setHighlightedNodeId(node.id);setSelectedNodeId(null);}:undefined} onOpenNodeSettings={runWorkflow?(node,trigger)=>{setNodeTrigger(trigger);setHighlightedNodeId(node.id);setSelectedNodeId(node.id);}:undefined}/>{testRun.source_version&&<p className="as-small-muted">이 실행에 사용한 소스: v{testRun.source_version}</p>}{!!testRun.library_source_files?.length&&<details className="as-evidence-list"><summary>실행에 사용한 자료함 파일 ({testRun.library_source_files.length})</summary>{testRun.library_source_files.map(file=><p key={file.space+":"+file.asset_id+":"+file.version}><strong>{file.name}</strong> · {file.space==="team"?"팀 자료함":"내 자료함"}<small className="as-source-version"> · 버전 {file.version}</small></p>)}</details>}{unverifiedFields.length>0&&<p role="status">원문에서 확인하지 못해 빈칸으로 둔 항목: {unverifiedFields.join(' · ')}</p>}{testRun.rows?.length>0&&<div className="as-table-scroll"><table><thead><tr>{Object.keys(testRun.rows[0]).map(k=><th key={k}>{("evidence" in testRun.rows[0]&&"field" in testRun.rows[0])?({file_name:"파일",field:"항목",value:"추출값",status:"확인 상태",evidence:"근거"} as Record<string,string>)[k]||k:k}</th>)}</tr></thead><tbody>{testRun.rows.slice(0,10).map((r,i)=><tr key={i}>{Object.keys(testRun.rows[0]).map(k=><td key={k}>{k==='evidence'&&r[k]?<button className="as-text-button" onClick={()=>setEvidence(r[k] as any)}>원문 확인</button>:typeof r[k]==='object'&&r[k]!==null?JSON.stringify(r[k]):k==='status'?({verified:'원문 일치',not_found_or_unverified:'누락 또는 근거 미확인'} as Record<string,string>)[String(r[k])]||String(r[k]):String(r[k]??'')}</td>)}</tr>)}</tbody></table><small>전체 {testRun.rows.length}행 · 최대 10행 미리보기</small></div>}{testRun.public_projection&&(testRun.public_projection.evidence_truncated||testRun.public_projection.quote_truncated)&&<p className="as-small-muted" role="status">근거 {testRun.public_projection.evidence_total}개 중 {testRun.public_projection.evidence_returned}개를 표시합니다. 긴 인용은 앞부분을 표시하며 전체 실행 데이터는 서버에 보관됩니다.</p>}<details className="as-evidence-list"><summary>실행에 사용한 근거 확인 ({testRun.evidence?.length||0})</summary>{testRun.evidence?.map((e,i)=><button key={i} className="as-resource" onClick={()=>setEvidence(e)}>{e.file_name}{e.page?` · ${e.page}쪽`:""}<span>원문 보기</span></button>)}</details>{!selected.deleted_at&&testRun.status==='failed'&&!uncertainSlackDelivery&&<button className="as-button" disabled={!!busy||!!recovery||libraryBusy||(slackRequired&&!slackConnected)} onClick={retryRun}>실패 단계부터 재시도</button>}{!!testRun.reviews?.length&&<ReplyReviewPanel reviews={testRun.reviews} runId={testRun.id} disabled={!!busy||!!recovery||libraryBusy} canDecide={!selected.deleted_at&&testRun.status==='succeeded'} onDecision={decideReply}/>}{(testRun.attempts?.length||0)>1&&<details className="as-evidence-list"><summary>실행·재개 이력 ({testRun.attempts!.length}회)</summary>{testRun.attempts!.map(a=><p key={a.number}>{a.number}차 · {({succeeded:'성공',failed:'실패',running:'실행 중',needs_input:'응답 대기'} as Record<string,string>)[a.status]||a.status}{a.error?' · '+a.error:''}</p>)}</details>}<Trace steps={testRun.steps}/></div>}</div>:<><div className={'as-messages'+(!pendingMessage&&!externalMessages.length&&!session?.messages.length&&!session?.file_inspection?.length?' is-empty':'')} tabIndex={0} role="region" aria-label="대화 내용">{loading?<div className="as-loading"><Loader2 className="as-spin"/>저장한 대화를 확인하고 있습니다.</div>:!pendingMessage&&!externalMessages.length&&!session?.messages.length&&!session?.file_inspection?.length?<div className="as-welcome"><span className="as-welcome-icon"><WorkflowIcon size={27}/></span><h2>어떤 일을 처리할까요?</h2><p>사용할 자료, 처리할 조건, 원하는 결과를 설명하세요.</p>{samples.length>0&&<div className="as-examples">{samples.map(s=><button key={s.label} onClick={()=>{setText(s.text);input.current?.focus();}}><strong>{s.label}<ArrowUp size={14}/></strong><span>{s.text.slice(0,75)}…</span></button>)}</div>}</div>:session?.messages.map((message, i) => {
+
+      let content = message.content;
+      if (!selected && i === lastAssistant) {
+        if (receiptQuestion) {
+          const superseded = receiptQuestion.supersedes_texts || [];
+          content = content.split('\n').filter(line => !superseded.includes(line.trim().replace(/^•\s*/, ''))).join('\n');
+          content = content.replace(receiptQuestion.text, '').trim();
+        } else if (clarificationQuestions.length) {
+          content = content.split('\n').filter(line => !clarificationQuestions.some(q => q.text.trim() === line.trim().replace(/^•\s*/, ''))).join('\n').trim();
+        }
+      }
+      return content ? <StudioMessage key={i} role={message.role} content={content} animate={animatedMessage===session?.id+':'+i}/> : null;
+    })}
+     {externalMessages.map((message,index)=><StudioMessage key={'external-'+index} role={message.role} content={message.content} animate={index===externalMessages.length-1}/>)}
+    {!selected&&session?.file_inspection?.length ? <FileInspection files={session.file_inspection}
+      detailsFor={id=>{
+        const asset=session.resources.find(resource=>resource.id===id);
+        if(!asset)return;
+        const full=asset.text?.trim() || (asset.kind==='table' && asset.row_count<=asset.preview.length);
+        return {label:full?'읽은 내용 전체 보기':'자료 상세 보기',open:()=>setResource(asset)};
+      }} factsFor={id=>{const asset=session.resources.find(resource=>resource.id===id);return asset?{row_count:asset.kind==='table'?asset.row_count:undefined,page_count:asset.page_count}:undefined;}}
+      initial={!session.messages.some(message=>message.role==='user')} fresh={freshFiles.session===session.id?freshFiles.ids:[]} readOnly={!!receiptQuestion}
+      selection={documentTableQuestionId?{
+        disabled:!!busy||!!recovery||libraryBusy,
+        onAnswer:(message,selection)=>selection?void send(undefined,message,undefined,[{questionId:documentTableQuestionId,text:message,value:JSON.stringify({document_selection:selection})}]):void send(undefined,message,documentTableQuestionId),
+      }:undefined}/> : null}
+    {receiptQuestion?.action ? <ReceiptQuestion key={receiptQuestion.id} text={receiptQuestion.text} action={receiptQuestion.action}
+      disabled={!!busy||!!recovery||libraryBusy} onAttach={()=>fileInput.current?.click()} onLibrary={()=>setAttachMode('library')} onAnswer={answer=>void send(undefined,answer,receiptQuestion.id)}/> : !selected&&slackChannelQuestion ? <SlackChannelPicker key={session?.id+'-'+slackChannelQuestion.id} disabled={!!busy||!!recovery||libraryBusy} onSelect={channelId=>send(undefined,channelId,slackChannelQuestion.id)} onReconnect={()=>leave('connections')}/> : !selected&&clarificationQuestions.length>0&&<ClarificationForm key={session?.id} questions={clarificationQuestions} disabled={!!busy||!!recovery||libraryBusy} onDirtyChange={setClarificationDirty} onPickFiles={picker=>setFilePicker(picker)} onSubmit={answerQuestions}/>}<DesignFailureNotice failure={generationFailure} hasDraft={!!session?.draft?.workflow} disabled={!!busy||!!recovery||libraryBusy} onRetry={()=>void send(undefined,RETRY_PROMPT)}/>{pendingMessage&&<div className="as-message user"><span className="as-message-label">나</span><p>{pendingMessage}</p></div>}{busy&&<div className="as-busy as-operation-progress" role="status"><Loader2 size={17} className="as-spin" aria-hidden="true"/><span>{busy}</span></div>}<div ref={end}/></div><form className="as-composer" onSubmit={send}
+    onDragOver={event=>{if(Array.from(event.dataTransfer.types).includes('Files'))event.preventDefault();}}
+    onDrop={event=>{
+     const files=event.dataTransfer.files;
+     if(!files.length)return;
+     event.preventDefault();
+     if(busy||recovery||libraryBusy||saved||!credentialId&&!session)return;
+     void attachResources(Array.from(files));
+    }}><textarea ref={input} aria-label="업무 설명" placeholder={collecting?'확인 질문에 답해주세요.':draft?'추가하거나 바꿀 조건을 설명하세요.':'예: 여러 자료에서 필요한 내용을 찾아 정리하는 기능이 필요해요.'} value={text} onChange={e=>setText(e.target.value)} maxLength={4000} disabled={!!busy||!!recovery||saved} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();void send();}}}/><div className="as-composer-footer"><button data-tour="attach" type="button" className="as-text-button" onClick={()=>setAttachMode('choose')} disabled={!!busy||!!recovery||saved||!credentialId&&!session}><Paperclip size={16}/>자료 연결</button><small>Enter 전송 · Shift+Enter 줄바꿈</small><button type="submit" className="as-send" disabled={!!busy||!text.trim()||saved||!credentialId&&!session} aria-label="업무 설명 보내기"><ArrowUp size={19}/></button></div></form></>}
+
    </section>
-   {screen==='workflow'&&<section className="as-workspace" aria-label="워크플로우 캔버스"><WorkflowPreview workflow={draft?.workflow} selectedId={selectedNodeId} onSelect={n=>setSelectedNodeId(n.id)}/></section>}
-   <aside className="as-config" aria-label="에이전트 설정 초안"><div className="as-panel-header"><span><SlidersHorizontal size={17}/>{selectedNode?'노드 설정':saved?'저장한 설정':'워크플로우 설정'}</span><span className={'as-status '+(ready||saved?'ready':'')}>{saved?'저장됨':ready?'확인 가능':session?.status==='validation_failed'?'검증 실패':draft?'확인 중':'작성 전'}</span></div><div className="as-config-body">{selectedNode?<NodeInspector node={selectedNode} tool={catalog.find(t=>t.id===selectedNode.tool)} onClose={()=>setSelectedNodeId(null)}/>:<><div className="as-model-block"><label htmlFor="builder-model">{draft?.schedule?"생성 모델":"모델"}</label>{session||selected?<p>{currentModel}</p>:<input id="builder-model" value={model} onChange={e=>setModel(e.target.value)} maxLength={120} disabled={!!busy}/>}<label htmlFor="builder-account">연결 계정</label>{session||selected?<p>{credentials.find(c=>c.id===(selected?.credential_id||session?.credential_id))?.name||'저장한 연결 계정'}</p>:credentials.length?<select id="builder-account" value={credentialId} onChange={e=>setCredentialId(e.target.value)} disabled={!!busy}>{credentials.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select>:<button className="as-button" onClick={()=>setConnection(true)}><Plus size={15}/>모델 계정 연결</button>}</div>
-    {draft?<>{draft.schedule&&!saved&&<div className="as-setting-section"><label>예약 트리거</label><p>{draft.schedule.frequency==='daily'?'매일':'매주'} · {draft.schedule.hour??'시간 확인'}:{String(draft.schedule.minute??0).padStart(2,'0')} · {draft.schedule.timezone||'시간대 확인 필요'}</p><p>저장 위치: {draft.report_destination==='reports'?'A4B 서버 보고서 보관함':'확인 필요'}</p></div>}<div className="as-setting-section"><label>이름과 역할</label><h3>{draft.name||'이름 확인 필요'}</h3><p>{draft.purpose}</p></div><div className="as-setting-section"><label>지시사항</label><details open><summary>생성한 지시사항 확인<ChevronDown size={15}/></summary><p className="as-preserve as-instructions">{draft.instructions||'업무를 더 설명해주세요.'}</p></details></div>{draft.workflow?.nodes.filter(n=>n.tool==='filter_sort').map(n=><div className="as-setting-section" key={n.id}><label>{n.label} · 개별 실행 규칙</label><RuleSummary plan={(n.settings.execution_plan||draft.execution_plan) as Draft['execution_plan']}/></div>)}<div className="as-setting-section"><label>연결 도구 <span>{draft.tool_ids.length}</span></label>{draft.tool_ids.map(id=>{const info=toolDetails[id];const actual=info||{label:({aggregate_table:'목록 집계',finish:'완료 안내',read_document:'문서 읽기',search_document:'관련 내용 검색',extract_information:'정보 추출',compose_answer:'근거 기반 답변',export_result:'결과 저장',condition:'조건 분기',ask_user:'사용자 확인',agent_node:'에이전트 실행',reply_review:'응대 초안 검수',review_summary:'검수 보고서 정리',saved_workflow:'저장된 워크플로우 실행'} as Record<string,string>)[id]||id,description:'등록된 공통 노드 코드를 실행합니다.',Icon:FileText};const Icon=actual.Icon;return <div key={id} className="as-tool"><Icon size={17}/><div><strong>{actual.label}</strong><small>{actual.description}</small></div><Check size={14}/></div>;})}</div><div className="as-setting-section"><label>업무 조건과 근거</label>{draft.requirements.map((r,i)=><details key={i} className="as-evidence"><summary>{r.description}<ChevronDown size={13}/></summary><small>{r.source_id==='user'?'사용자 대화':resources.find(f=>f.id===r.source_id)?.name||'연결 자료'}</small><blockquote>{r.quote}</blockquote></details>)}</div></>:<div className="as-empty-config"><FileText size={26}/><p>대화를 시작하면 이름·지시사항·도구가 이곳에 정리됩니다.</p></div>}
-    <div className="as-setting-section"><label>연결 자료 <span>{resources.length}/10</span></label>{resources.map(r=><button key={r.id} className="as-resource" onClick={()=>setResource(r)}><FileText size={17}/><span><strong>{r.name}</strong><small>{r.kind==='table'?r.row_count+'행 · '+r.columns.length+'개 열':'업무 규칙 문서'}</small></span><ChevronDown size={14}/></button>)}{!resources.length&&<p className="as-small-muted">파일 구조나 업무 규칙을 참고하려면 자료를 연결하세요.</p>}</div>
-    {session && !collecting && session.issues.length>0&&<div className="as-validation" role="status">{session.issues.map((issue,i)=><p key={i}>{issue}</p>)}</div>}{draft && draft.unsupported.length>0&&<div className="as-validation">{draft.unsupported.map((v,i)=><p key={i}>{v}</p>)}</div>}{session && session.trace.length>0&&<Trace steps={session.trace}/>}</>}</div>{!saved&&<div className="as-config-footer"><p>{ready?'설정을 확인했다면 에이전트를 생성하세요.':collecting?'왼쪽 확인 질문에 답하면 초안을 구성합니다.':'필요한 조건을 확인한 뒤 생성할 수 있습니다.'}</p><button className="as-button as-primary" onClick={save} disabled={!ready||!!busy}><Check size={17}/>{session?.base_version?'새 버전 저장':draft?.schedule?'자동화 저장':'초안 확인 · 저장'}</button></div>}</aside></div>
-  </main>}</div><input ref={fileInput} hidden type="file" accept=".csv,.xlsx,.json,.txt,.md,.pdf" onChange={e=>{const f=e.target.files?.[0];if(f)void upload(f);}}/>
-  <input ref={sourceInput} hidden type="file" accept=".csv,.xlsx,.json" onChange={e=>{const f=e.target.files?.[0];if(f)void uploadSource(f);}}/><input ref={runFileInput} hidden type="file" accept=".csv,.xlsx,.json,.txt,.md,.pdf" onChange={e=>{const f=e.target.files?.[0];if(f)void uploadRun(f);}}/><Dialog open={!!evidence} onOpenChange={v=>{if(!v)setEvidence(null);}}><DialogContent className="as-dialog"><DialogHeader><DialogTitle>실행 근거 원문</DialogTitle><DialogDescription>{evidence?.file_name}{evidence?.page?` · ${evidence.page}쪽`:""}</DialogDescription></DialogHeader><p className="as-preserve">{evidence?.quote||evidence?.text}</p>{evidence?.file_id&&<a className="as-button" href={"/api/agent-builder/original?id="+encodeURIComponent(evidence.file_id)+(evidence.page?"#page="+evidence.page:"")} target="_blank" rel="noreferrer">원본 파일 열기{evidence.page?` · ${evidence.page}쪽`:""}</a>}<p className="as-small-muted">파서가 읽은 원문입니다. 추출 결과의 인용은 이 원문과 일치하는지 검사합니다. 답변에 사용한 구간은 답변 전체의 정확성을 보증하지 않습니다.</p></DialogContent></Dialog><Dialog open={help} onOpenChange={setHelp}><DialogContent className="as-dialog"><DialogHeader><DialogTitle>에이전트 만드는 방법</DialogTitle><DialogDescription>하나의 업무를 맡길 에이전트를 대화로 만듭니다.</DialogDescription></DialogHeader><ol className="as-guide"><li><strong>노드 만들기</strong><p>기본 노드를 고르거나 에이전트 역할·처리 설정을 저장합니다. 수정은 새 버전으로 저장합니다.</p></li><li><strong>업무 설명과 자료 연결</strong><p>워크플로우 설계에서 모델 계정을 선택하고 CSV·PDF 등 자료와 필요한 결과를 설명합니다. 직접 선택하지 않은 노드는 설계 에이전트가 구성합니다.</p></li><li><strong>연결·설정 확인 후 저장</strong><p>캔버스 노드를 눌러 입력·출력·지시사항·개별 규칙을 확인합니다. 확인한 초안을 저장하면 사용할 서비스가 됩니다.</p></li><li><strong>서비스 실행</strong><p>요청과 자료를 넣어 실행하고 결과·근거·단계 기록을 확인합니다. 검수 후 수정한 응대는 마지막 수정문을 승인 대상으로 표시합니다.</p></li><li><strong>응대 수정·승인 또는 거절</strong><p>AI 검수 의견과 운영자 승인은 별개입니다. 표시된 최종 수정문을 확인하고 수정·승인 또는 거절하세요. 승인된 응대 CSV는 운영자가 승인한 문장만 포함합니다.</p></li><li><strong>예약과 자료 갱신</strong><p>매일·매주 예약을 켜거나 중지하고 15초 후 시험 예약으로 확인합니다. 관리 데이터 소스를 갱신하면 다음 실행부터 새 버전이 적용됩니다.</p></li></ol><p className="as-small-muted">대화가 노드·입출력 연결·조건을 구성합니다. 캔버스는 연결 확인용이며 직접 노드를 이동하거나 연결을 편집하는 기능은 제공하지 않습니다. 저장한 흐름은 LangGraph로 실행됩니다. 문서 읽기·검색·추출·답변과 표 처리를 지원합니다. 매일·매주 서버 예약과 관리 데이터 소스 갱신을 지원합니다. 외부 전송·OCR·병렬·순환은 아직 지원하지 않습니다.</p></DialogContent></Dialog>
-  <Dialog open={connection} onOpenChange={v=>{if(!connectionBusy){setConnection(v);if(!v)setApiKey('');}}}><DialogContent className="as-dialog"><DialogHeader><DialogTitle>모델 연결</DialogTitle><DialogDescription>기존 데모와 같은 암호화 계정 저장소를 사용합니다. 키는 대화에 입력하지 마세요.</DialogDescription></DialogHeader><form onSubmit={connect} className="as-connection-form"><label className="as-field">연결 이름<input value={connectionName} onChange={e=>setConnectionName(e.target.value)} required maxLength={120}/></label><label className="as-field">OpenAI API 키<input type="password" value={apiKey} onChange={e=>setApiKey(e.target.value)} required autoComplete="off"/></label>{connectionError&&<p className="as-error" role="alert">{connectionError}</p>}<button className="as-button as-primary" disabled={connectionBusy}>{connectionBusy?'저장 중…':'연결 저장'}</button><p className="as-small-muted">모델 사용 시 해당 API 계정에 비용이 발생합니다.</p></form></DialogContent></Dialog>
-  <Dialog open={!!resource} onOpenChange={v=>{if(!v)setResource(null);}}><DialogContent className="as-dialog as-resource-dialog"><DialogHeader><DialogTitle>{resource?.name}</DialogTitle><DialogDescription>{resource?.kind==='table'?'실제로 읽은 파일의 열·행과 예외를 확인합니다.':'에이전트 설정에 사용할 업무 규칙 원문입니다.'}</DialogDescription></DialogHeader>{resource?.kind==='table'?<><div className="as-table-scroll"><table><thead><tr><th>열</th><th>자료형</th><th>빈 값</th></tr></thead><tbody>{resource.columns.map(k=><tr key={k}><td>{k}</td><td>{((resource.profile[k] as any)?.types||[]).join(', ')}</td><td>{(resource.profile[k] as any)?.missing||0}</td></tr>)}</tbody></table></div><div className="as-table-scroll"><table><thead><tr>{resource.columns.map(k=><th key={k}>{({file_name:"파일",field:"항목",value:"추출값",status:"확인 상태",evidence:"근거"} as Record<string,string>)[k]||k}</th>)}</tr></thead><tbody>{resource.preview.map((r,i)=><tr key={i}>{resource.columns.map(k=><td key={k}>{k==='evidence'&&r[k]?<button className="as-text-button" onClick={()=>setEvidence(r[k] as any)}>원문 확인</button>:typeof r[k]==='object'&&r[k]!==null?JSON.stringify(r[k]):k==='status'?({verified:'원문 일치',not_found_or_unverified:'누락 또는 근거 미확인'} as Record<string,string>)[String(r[k])]||String(r[k]):String(r[k]??'')}</td>)}</tr>)}</tbody></table></div></>:<div>{resource?.engine&&<p className="as-small-muted">{resource.engine} · {resource.page_count}페이지</p>}{resource?.warnings?.map((w,i)=><p className="as-validation" key={i}>{w}</p>)}<p className="as-preserve">{resource?.text}</p></div>}</DialogContent></Dialog>
+   {screen==='workflow'&&<section data-tour="canvas" className="as-workspace" aria-label="워크플로우 캔버스"><WorkflowPreview onToggleConversation={()=>setConversationCollapsed(value=>!value)} conversationCollapsed={conversationCollapsed} workflow={draft?.workflow} selectedId={highlightedNodeId} onSelect={n=>{setHighlightedNodeId(n.id);setSelectedNodeId(null);}} onOpenSettings={(node,trigger)=>{setNodeTrigger(trigger);setHighlightedNodeId(node.id);setSelectedNodeId(node.id);}}/></section>}
+   <aside data-tour="settings" className="as-config" aria-label="워크플로우 설정"><button type="button" className="as-panel-header as-config-toggle" aria-expanded={settingsOpen} aria-controls="workflow-settings-detail" onClick={()=>setSettingsOpen(open=>!open)}><span><SlidersHorizontal size={17}/>설정</span><span className={'as-status '+(ready||saved?'ready':'')}>{saved?'저장됨':ready?'확인 가능':session?.status==='validation_failed'?'검증 실패':draft?'확인 중':'작성 전'}<ChevronDown size={15} aria-hidden="true"/></span></button><div id="workflow-settings-detail" hidden={!settingsOpen} className="as-config-body" tabIndex={0} role="region" aria-label="설정 상세"><>
+
+    {draft?<>{draft.schedule&&!saved&&<div className="as-setting-section"><label>예약 트리거</label><p>{scheduleDescription(draft.schedule)} · {draft.schedule.timezone||'시간대 확인 필요'}</p><p>저장 위치: {draft.report_destination==='reports'?'A4B 서버 보고서 보관함':'확인 필요'}</p></div>}<div className="as-setting-section"><label>이름과 역할</label><h3>{draft.name||'이름 확인 필요'}</h3><p>{draft.purpose}</p></div><div className="as-setting-section"><label>지시사항</label><details open={saved || undefined}><summary>작업 내용 자세히 보기<ChevronDown size={15}/></summary><p className="as-preserve as-instructions">{draft.instructions||'업무를 더 설명해주세요.'}</p></details></div>{draft.workflow?.nodes.filter(n=>n.tool==='filter_sort').map(n=><div className="as-setting-section" key={n.id}><label>{n.label} · 개별 실행 규칙</label><RuleSummary plan={(n.settings.execution_plan||draft.execution_plan) as Draft['execution_plan']}/></div>)}<details className="as-setting-section"><summary>처리 기능 {draft.tool_ids.length}개 보기</summary>{draft.tool_ids.map(id=>{const info=toolDetails[id];const actual=info||{label:({aggregate_table:'목록 집계',calculate_columns:'표 열 계산·이름 변경',text_transform:'문자열 바꾸기',base64_codec:'Base64 문자열 변환',text_hash:'문자열 SHA-256',date_transform:'날짜·시간 변환',text_statistics:'문자·단어 수 세기',finish:'완료 안내',read_document:'문서 읽기',search_document:'관련 내용 검색',extract_information:'정보 추출',compose_answer:'근거 기반 답변',export_result:'결과 저장',condition:'조건 분기',ask_user:'사용자 확인',agent_node:'AI 작업',reply_review:'응대 초안 검수',review_summary:'검수 보고서 정리',saved_workflow:'저장된 워크플로우 실행'} as Record<string,string>)[id]||id,description:'등록된 공통 작업 코드를 실행합니다.',Icon:FileText};const Icon=actual.Icon;return <div key={id} className="as-tool"><Icon size={17}/><div><strong>{actual.label}</strong><small>{toolDescription(id,actual.description)}</small></div><Check size={14}/></div>;})}</details><div className="as-setting-section"><label>업무 조건과 근거</label>{draft.requirements.map((r,i)=><details key={i} className="as-evidence"><summary>{r.description}<ChevronDown size={13}/></summary><small>{r.source_id==='user'?'사용자 대화':resources.find(f=>f.id===r.source_id)?.name||'연결 자료'}</small><blockquote>{r.quote}</blockquote></details>)}</div></>:<div className="as-empty-config"><FileText size={26}/><p>업무를 설명하면 처리 순서와 확인할 조건이 정리됩니다.</p></div>}
+    {!selected&&session?.input_requirements?.map((item,i)=><div className="as-setting-section" key={"input-"+i}><label>{item.timing==='design'?'지금 필요한 자료':'실행 전에 필요한 자료'}</label><p>{item.description}</p>{item.fields.length>0&&<p>필요한 열: {item.fields.join(' · ')}</p>}<p>{item.ready?'연결 자료 있음 · 실제 실행 전 재확인':'파일 미연결'}</p><button type="button" className="as-text-button" disabled={!!busy||!!recovery||saved} onClick={()=>setAttachMode('choose')}>자료 연결</button></div>)}<div className="as-setting-section"><label>연결 자료 <span>{resources.length}/10</span></label>{resources.map(r=><button key={r.id} className="as-resource" onClick={()=>setResource(r)}><FileText size={17}/><span><strong>{r.name}</strong><small>{r.kind==='table'?r.row_count+'행 · '+r.columns.length+'개 열':'업무 규칙 문서'}</small></span><ChevronDown size={14}/></button>)}{!resources.length&&<p className="as-small-muted">파일 구조나 업무 규칙을 참고하려면 자료를 연결하세요.</p>}</div>
+    {session && !collecting && session.issues.length>0&&<div className="as-validation" role="status">{session.issues.map((issue,i)=><p key={i}>{issue}</p>)}</div>}{draft && draft.unsupported.length>0&&<div className="as-validation"><p>요청한 작업에 필요한 기능과 연결 상태를 추가로 확인해야 합니다.</p></div>}{session?.tool_gap&&<div className="as-validation"><p>부족한 기능을 기록했습니다. 기존 도구로 가능한지 검토한 뒤 임시 도구 시험으로 연결할 수 있습니다.</p><button type="button" disabled={!!busy||!!recovery||libraryBusy} onClick={()=>downloadToolGap(session).catch(e=>setError((e as Error).message))}>부족 기능 명세 받기</button></div>}{session && session.trace.length>0&&<Trace steps={session.trace}/>}</></div></aside>{inspectedNode&&inspectedWorkflow&&<NodePopover key={screen+':'+(screen==='workflow'?(session?.revision??selected?.version??'draft'):(testRun?.id||selected?.version||'current'))+':'+inspectedNode.id} node={inspectedNode} workflow={inspectedWorkflow} tool={catalog.find(tool=>tool.id===inspectedNode.tool)} placement={screen==='workflow'?'canvas':'run'} onClose={()=>setSelectedNodeId(null)} onModify={canModifyInspectedNode?request=>modifyInspectedNode(request):undefined} returnFocus={nodeTrigger}/>}</div>
+  </main>}</div><input ref={fileInput} hidden multiple type="file" accept={receiptQuestion ? receiptFileTypes : ".csv,.tsv,.xlsx,.xls,.json,.txt,.md,.pdf,.doc,.docx,.ppt,.pptx,.hwp,.hwpx,.jpg,.jpeg,.png,.bmp,.webp,.tif,.tiff,.heic"} onChange={e=>{const files=Array.from(e.currentTarget.files||[]);e.currentTarget.value='';if(files.length)void attachResources(files);}}/>
+  <input ref={sourceInput} hidden type="file" accept=".csv,.tsv,.xlsx,.xls,.json,.txt,.md,.pdf,.doc,.docx,.ppt,.pptx,.hwp,.hwpx,.jpg,.jpeg,.png,.bmp,.webp,.tif,.tiff,.heic" onChange={e=>{const f=e.target.files?.[0];if(f)void uploadSource(f);}}/><input ref={runFileInput} hidden type="file" accept=".csv,.tsv,.xlsx,.xls,.json,.txt,.md,.pdf,.doc,.docx,.ppt,.pptx,.hwp,.hwpx,.jpg,.jpeg,.png,.bmp,.webp,.tif,.tiff,.heic" onChange={e=>{const f=e.target.files?.[0];if(f)void uploadRun(f);}}/><Dialog open={!!evidence} onOpenChange={v=>{if(!v)setEvidence(null);}}><DialogContent className="as-dialog"><DialogHeader><DialogTitle>실행 근거 원문</DialogTitle><DialogDescription>{evidence?.file_name}{evidenceLocation(evidence)}</DialogDescription></DialogHeader><p className="as-preserve">{evidence?.quote||evidence?.text}</p>{evidence?.file_id&&<a className="as-button" href={(testRun?.library_source_files?.some(file=>file.execution_asset_id===evidence.file_id)?"/api/agent-builder/source_original?run_id="+encodeURIComponent(testRun.id)+"&asset_id="+encodeURIComponent(evidence.file_id):"/api/agent-builder/original?id="+encodeURIComponent(evidence.file_id))+(evidence.page?"#page="+evidence.page:"")} target="_blank" rel="noreferrer">원본 파일 열기{evidence.page?` · ${evidence.page}쪽`:""}</a>}<p className="as-small-muted">파서가 읽은 원문입니다. 추출 결과의 인용은 이 원문과 일치하는지 검사합니다. 답변에 사용한 구간은 답변 전체의 정확성을 보증하지 않습니다.</p></DialogContent></Dialog>
+
+
+
+  <Dialog open={saveReviewOpen} onOpenChange={setSaveReviewOpen}><DialogContent className="as-dialog as-save-review"><DialogHeader><DialogTitle>저장 전 예약 확인</DialogTitle><DialogDescription>요청에서 확인한 일정입니다. 예약을 함께 저장할지 확인하세요.</DialogDescription></DialogHeader>{draft?.schedule&&<><div className="as-save-review-summary"><strong>{scheduleDescription(draft.schedule)}</strong><span>서울 표준시 · Asia/Seoul</span>{scheduleDateNote(draft.schedule)&&<small>{scheduleDateNote(draft.schedule)}</small>}</div><fieldset className="as-save-schedule-choice"><legend>예약 설정</legend><label><input type="radio" name="save-schedule" value="include" checked={includeSchedule} onChange={()=>setIncludeSchedule(true)}/><span><strong>예약도 함께 저장</strong><small>예약은 꺼진 상태로 저장됩니다. 예약 관리에서 켜면 자동으로 실행됩니다.</small></span></label><label><input type="radio" name="save-schedule" value="omit" checked={!includeSchedule} onChange={()=>setIncludeSchedule(false)}/><span><strong>예약 없이 저장</strong><small>필요할 때 직접 실행하고, 나중에 예약을 추가할 수 있습니다.</small></span></label></fieldset><div className="as-save-review-actions"><button className="as-button" onClick={()=>setSaveReviewOpen(false)}>돌아가기</button><button className="as-button as-primary" disabled={!!busy||!!recovery||libraryBusy} onClick={()=>void save(includeSchedule)}>{includeSchedule?'예약과 함께 저장':'워크플로우만 저장'}</button></div></>}</DialogContent></Dialog>
+  <Dialog open={!!resource} onOpenChange={v=>{if(!v)setResource(null);}}><DialogContent className="as-dialog as-resource-dialog"><DialogHeader><DialogTitle>{resource?.name}</DialogTitle><DialogDescription>{resource?.kind==='table'?'실제로 읽은 파일의 열·행과 예외를 확인합니다.':'파일에서 읽은 본문을 확인합니다.'}</DialogDescription></DialogHeader>{resource?.original_path&&!resource.parser_metadata?.document_analysis&&<a className="as-text-button" href={'/api/agent-builder/original?id='+encodeURIComponent(resource.id)} target="_blank" rel="noreferrer">원본 파일 열기</a>}<DocumentAnalysisSummary analysis={resource?.parser_metadata?.document_analysis} showText={resource?.kind==='table'} humanReviewed={resource?.parser_metadata?.document_review?.status==='completed'}/>{resource?.parser_metadata?.document_analysis&&<DocumentReviewPanel key={resource.id} assetId={resource.id} onUpdated={updateReviewedAsset} disabled={!!busy}/>}{resource?.kind==='table'?<><div className="as-table-scroll"><table><thead><tr><th>열</th><th>자료형</th><th>빈 값</th></tr></thead><tbody>{resource.columns.map(k=><tr key={k}><td>{k}</td><td>{((resource.profile[k] as any)?.types||[]).join(', ')}</td><td>{(resource.profile[k] as any)?.missing||0}</td></tr>)}</tbody></table></div><div className="as-table-scroll"><table><thead><tr>{resource.columns.map(k=><th key={k}>{({file_name:"파일",field:"항목",value:"추출값",status:"확인 상태",evidence:"근거"} as Record<string,string>)[k]||k}</th>)}</tr></thead><tbody>{resource.preview.map((r,i)=><tr key={i}>{resource.columns.map(k=><td key={k}>{k==='evidence'&&r[k]?<button className="as-text-button" onClick={()=>setEvidence(r[k] as any)}>원문 확인</button>:typeof r[k]==='object'&&r[k]!==null?JSON.stringify(r[k]):k==='status'?({verified:'원문 일치',not_found_or_unverified:'누락 또는 근거 미확인'} as Record<string,string>)[String(r[k])]||String(r[k]):String(r[k]??'')}</td>)}</tr>)}</tbody></table></div></>:<div>{!resource?.parser_metadata?.document_analysis&&resource?.engine&&<p className="as-small-muted">{resource.engine} · {resource.page_count}페이지</p>}{!resource?.parser_metadata?.document_analysis&&resource?.warnings?.map((w,i)=><p className="as-validation" key={i}>{w}</p>)}<p className="as-preserve">{resource?.text}</p></div>}</DialogContent></Dialog>
  </div>;
 }
+function RunRequestDetails({hasText,children}:{hasText:boolean;children:ReactNode}){
+ const [open,setOpen]=useState(hasText);
+ const shown=useRef(hasText);
+ useEffect(()=>{
+  if(hasText&&!shown.current){shown.current=true;setOpen(true);}
+ },[hasText]);
+ return <details className="as-run-source-settings" open={open} onToggle={event=>setOpen(event.currentTarget.open)}>{children}</details>;
+}
 function Trace({steps}:{steps:Session['trace']}){return <details className="as-trace"><summary>처리 단계 확인<ChevronDown size={14}/></summary><ol>{steps.map((s,i)=><li key={i}><strong>{s.label}</strong><span>{s.detail}{typeof (s as any).elapsed_ms==='number'?` · ${(s as any).elapsed_ms}ms`:''}</span>{(s as any).input_summary&&<pre>{JSON.stringify({입력:(s as any).input_summary,출력:(s as any).output_summary},null,2)}</pre>}{(s as any).parameters&&<pre>{JSON.stringify((s as any).parameters,null,2)}</pre>}{(s as any).child_steps&&<details><summary>재사용한 워크플로우 내부 단계 · 버전 {(s as any).dependency?.version}</summary><Trace steps={(s as any).child_steps}/></details>}{(s as any).bindings?.length>0&&<pre>{JSON.stringify((s as any).bindings,null,2)}</pre>}</li>)}</ol></details>;}
-function WorkflowPreview({workflow,selectedId,onSelect}:{workflow?:Workflow|null;selectedId?:string|null;onSelect?:(node:Workflow['nodes'][number])=>void}){
- const [zoom,setZoom]=useState(1);
- const viewport=useRef<HTMLDivElement>(null);
- const levels:Record<string,number>=workflow?{[workflow.entry]:0}:{};
- if(workflow)for(let pass=0;pass<workflow.nodes.length;pass++)for(const e of workflow.edges)if(levels[e.source]!==undefined)levels[e.target]=Math.min(workflow.nodes.length,Math.max(levels[e.target]||0,levels[e.source]+1));
- const counts:Record<number,number>={},positions:Record<string,{x:number;y:number}>={};
- for(const n of workflow?.nodes||[]){const level=levels[n.id]||0;positions[n.id]={x:level*270+50,y:(counts[level]||0)*155+100};counts[level]=(counts[level]||0)+1;}
- const width=(Math.max(0,...Object.values(levels))+1)*270+60,height=Math.max(390,...Object.values(counts).map(v=>v*155+170));
- function fit(){const el=viewport.current;if(el)setZoom(Math.min(1,Math.max(.35,Math.min((el.clientWidth-50)/width,(el.clientHeight-50)/height))));}
- useEffect(()=>{const el=viewport.current;if(!el)return;fit();const observer=new ResizeObserver(()=>fit());observer.observe(el);return()=>observer.disconnect();},[width,height,workflow?.entry]);
- const label=(tool:string)=>['read_document','read_table'].includes(tool)?'입력':tool==='condition'?'조건':tool==='ask_user'?'확인':['finish','export_result','write_result'].includes(tool)?'출력':tool==='agent_node'?'에이전트':'처리';
- return <><div className="as-canvas-toolbar"><span><Box size={16}/>워크플로우 <small>{workflow?workflow.nodes.length+'개 노드':'초안 대기'}</small></span><small>노드를 선택해 설정 확인</small></div><div className="as-desktop-canvas" ref={viewport}>{workflow?<div style={{width:width*zoom,height:height*zoom}} className="as-canvas-size"><div className="as-flow-canvas" style={{width,height,transform:`scale(${zoom})`,transformOrigin:'top left'}}><svg width={width} height={height} aria-hidden="true"><defs><marker id="desktop-flow-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="#999999"/></marker></defs>{workflow.edges.map((e,i)=>{const a=positions[e.source],b=positions[e.target];if(!a||!b)return null;return <g key={i}><path d={`M ${a.x+210} ${a.y+53} C ${a.x+240} ${a.y+53}, ${b.x-30} ${b.y+53}, ${b.x} ${b.y+53}`} fill="none" stroke="#999999" strokeWidth="1.7" markerEnd="url(#desktop-flow-arrow)"/>{e.branch!=='next'&&<text x={(a.x+b.x)/2+100} y={(a.y+b.y)/2+38} fill="#777777" fontSize="11">{e.branch==='yes'?'조건 충족':'조건 미충족'}</text>}</g>;})}</svg>{workflow.nodes.map(n=><button key={n.id} aria-pressed={selectedId===n.id} className={'as-flow-node kind-'+n.tool+(selectedId===n.id?' selected':'')+(n.tool==='condition'?' branch':'')} style={{left:positions[n.id].x,top:positions[n.id].y}} title={n.label} onClick={()=>onSelect?.(n)}><span className="as-node-kind">{label(n.tool)}</span><strong>{n.label}</strong><small>{n.bindings.length?'앞 단계 결과 사용':'실행 요청·연결 자료'}</small><i className="as-port-in"/><i className="as-port-out"/></button>)}</div></div>:<div className="as-canvas-empty"><span className="as-empty-line"/><div className="as-empty-flow"><span>자료 입력</span><span>에이전트 처리</span><span>결과 출력</span></div><h2>설명에서 흐름으로</h2><p>왼쪽에 업무를 설명하고 CSV·PDF를 연결하세요.<br/>생성한 노드와 연결이 이 작업 공간에 나타납니다.</p><small>구성 안내 · 아직 생성된 노드가 없습니다.</small></div>}</div><div className="as-canvas-footer"><small>{workflow?'연결된 순서대로 실행 · 설정은 저장한 버전 사용':'필요한 노드를 설계 에이전트가 구성합니다.'}</small><div className="as-zoom"><button onClick={()=>setZoom(z=>Math.max(.35,z-.1))} disabled={!workflow||zoom<=.35} aria-label="캔버스 축소"><ZoomOut size={16}/></button><span>{Math.round(zoom*100)}%</span><button onClick={()=>setZoom(z=>Math.min(1.5,z+.1))} disabled={!workflow||zoom>=1.5} aria-label="캔버스 확대"><ZoomIn size={16}/></button><button onClick={fit} disabled={!workflow} aria-label="화면에 맞추기"><Maximize2 size={16}/></button></div></div></>;
-}
-function NodeInspector({node,tool,onClose}:{node:Workflow['nodes'][number];tool?:ToolInfo;onClose:()=>void}){
- const settings=node.settings;
- return <div className="as-node-inspector"><button className="as-text-button" onClick={onClose}><ArrowLeft size={14}/>전체 설정</button><div className="as-setting-section"><label>{node.tool==='agent_node'?'에이전트 노드':'처리 노드'}</label><h3>{node.label}</h3><small className="as-small-muted">{node.id} · {node.tool}</small></div><div className="as-setting-section"><label>입력 연결</label>{node.bindings.length?node.bindings.map((b,i)=><p className="as-binding" key={i}>{b.node_id}.{b.output}<br/><span>→ {b.input}</span></p>):<p className="as-small-muted">실행 요청 또는 연결한 자료를 사용합니다.</p>}{tool&&<p className="as-small-muted">지원 입력: {Object.entries(tool.input_ports).map(([name,type])=>name+' · '+type).join(', ')||'실행 자료'}</p>}</div><div className="as-setting-section"><label>출력</label>{tool&&Object.entries(tool.output_ports).map(([name,type])=><p className="as-binding" key={name}>{name}<span> · {type}</span></p>)}</div>{typeof settings.instructions==='string'&&settings.instructions&&<div className="as-setting-section"><label>지시사항</label><p className="as-preserve as-instructions">{settings.instructions}</p></div>}{settings.execution_plan!=null&&<div className="as-setting-section"><label>처리 규칙</label><RuleSummary plan={settings.execution_plan as Draft['execution_plan']}/></div>}{typeof settings.node_ref==='string'&&<div className="as-setting-section"><label>고정한 노드 버전</label><p className="as-small-muted as-preserve">{settings.node_ref}</p></div>}<details className="as-setting-section"><summary>세부 설정 확인</summary><pre className="as-node-json">{JSON.stringify(settings,null,2)}</pre></details><p className="as-small-muted as-inspector-note">설정을 바꾸려면 왼쪽 대화에서 변경할 조건을 설명하세요. 저장한 노드는 노드 만들기 화면에서 새 버전으로 수정할 수 있습니다.</p></div>;
-}
-
-function RuleSummary({plan}:{plan:Draft['execution_plan']}){if(!plan)return null;return <div className="as-rule-summary">{plan.filters.map((f,i)=><p key={i}>{f.field} {f.operator} {f.compare_field||String(f.value??'')}</p>)}{plan.sort.map((v,i)=><p key={i}>{v.field} · {v.direction}</p>)}<p>조건 결합: {plan.match==='all'?'모두 충족':'하나 이상 충족'} · 빈 값: {plan.missing_policy}</p><p>중복: {plan.duplicate_policy}{plan.duplicate_field?' · '+plan.duplicate_field:''}</p></div>;}

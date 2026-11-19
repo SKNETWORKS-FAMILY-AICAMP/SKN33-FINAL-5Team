@@ -1,0 +1,127 @@
+# App, Python workers and document readers run in the container; Ollama runs on the host PC
+# so it can use the host GPU directly (Windows NVIDIA or Apple Silicon).
+# Prepare Ollama first: scripts/setup/prepare-ollama.ps1 (Windows) or scripts/setup/prepare-ollama.sh (macOS/Linux).
+# Values below can be overridden from a repository-root .env (Compose reads it for ${...}).
+services:
+  app:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile
+      args:
+        A4B_WITH_ML: ${A4B_WITH_ML:-1}
+    image: a4b-agent-studio:local
+    ports:
+      # Host and container port must match: the server only accepts its own 127.0.0.1:<PORT> host.
+      - "127.0.0.1:${A4B_DOCKER_PORT:-3030}:${A4B_DOCKER_PORT:-3030}"
+    environment:
+      PYTHONUTF8: "1"
+      A4B_LINK_ALLOWED_HOSTS: ${A4B_LINK_ALLOWED_HOSTS:-}
+      # Google credentials must come from authorized user-scoped connectors, never shared env tokens.
+      HOST: 0.0.0.0
+      PORT: ${A4B_DOCKER_PORT:-3030}
+      EASYFLOW_DATA_DIR: /app/data
+      A4B_AUTH_MODE: ${A4B_AUTH_MODE:-off}
+      A4B_VISUAL_SCHEDULER_ENABLED: ${A4B_VISUAL_SCHEDULER_ENABLED:-1}
+      EASYFLOW_PUBLIC_URL: ${EASYFLOW_PUBLIC_URL:-}
+      A4B_GMAIL_CLIENT_ID: ${A4B_GMAIL_CLIENT_ID:-}
+      A4B_GMAIL_CLIENT_SECRET: ${A4B_GMAIL_CLIENT_SECRET:-}
+      A4B_SHEETS_CLIENT_ID: ${A4B_SHEETS_CLIENT_ID:-}
+      A4B_SHEETS_CLIENT_SECRET: ${A4B_SHEETS_CLIENT_SECRET:-}
+      A4B_SLACK_CLIENT_ID: ${A4B_SLACK_CLIENT_ID:-}
+      A4B_SLACK_CLIENT_SECRET: ${A4B_SLACK_CLIENT_SECRET:-}
+      A4B_S3_BUCKET: ${A4B_S3_BUCKET:-}
+      AWS_REGION: ${AWS_REGION:-ap-northeast-2}
+      A4B_COGNITO_USER_POOL_ID: ${A4B_COGNITO_USER_POOL_ID:-}
+      A4B_COGNITO_CLIENT_ID: ${A4B_COGNITO_CLIENT_ID:-}
+      A4B_COGNITO_DOMAIN: ${A4B_COGNITO_DOMAIN:-}
+      A4B_AUTH_USER_STORE: ${A4B_AUTH_USER_STORE:-postgres}
+      A4B_DATABASE_URL: ${A4B_DATABASE_URL:-}
+      # Place the public RDS CA bundle in the data volume, then set its /app/data/... path.
+      A4B_DATABASE_CA_FILE: ${A4B_DATABASE_CA_FILE:-}
+      A4B_DATABASE_TLS_SERVER_NAME: ${A4B_DATABASE_TLS_SERVER_NAME:-}
+      A4B_AUTH_SESSION_SECONDS: ${A4B_AUTH_SESSION_SECONDS:-28800}
+      # Business data: sqlite (local default) or postgres (RDS, same A4B_DATABASE_* settings as above).
+      # Run scripts/deploy/apply-builder-migrations.py before switching to postgres.
+      # Migration guide: https://github.com/20260528-skn-family-ai-33/SKN33-Final-5Team/blob/7d48d0f0d0ae5681753e299abed5723da81a1108/docs/business-data-storage.md#스키마-적용
+      A4B_STORAGE: ${A4B_STORAGE:-sqlite}
+      A4B_WORKER_MAX_CONCURRENCY: ${A4B_WORKER_MAX_CONCURRENCY:-12}
+      A4B_WORKER_CONTROL_CONCURRENCY: ${A4B_WORKER_CONTROL_CONCURRENCY:-4}
+      A4B_MAIN_PROVIDER: ${A4B_MAIN_PROVIDER:-ollama}
+      # EC2-hosted Ollama is a shared server only when explicitly selected.
+      A4B_SHARED_MODEL_TARGET: ${A4B_SHARED_MODEL_TARGET:-runpod}
+      A4B_MAIN_BASE_URL: ${A4B_MAIN_BASE_URL:-${A4B_DOCKER_OLLAMA_URL:-http://host.docker.internal:11434}/v1}
+      A4B_MAIN_API_KEY: ${A4B_MAIN_API_KEY:-}
+      A4B_MAIN_MODEL: ${A4B_MAIN_MODEL:-${A4B_LLM_MODEL:-a4b-qwen35-4b-16k}}
+      # Blank values preserve the application's existing defaults.
+      A4B_CAPABILITY_MODEL: ${A4B_CAPABILITY_MODEL:-}
+      A4B_OLLAMA_MODEL_ALIASES: ${A4B_OLLAMA_MODEL_ALIASES:-}
+      A4B_OLLAMA_NUM_CTX: ${A4B_OLLAMA_NUM_CTX:-}
+      A4B_OLLAMA_NUM_PREDICT: ${A4B_OLLAMA_NUM_PREDICT:-}
+      A4B_OLLAMA_TEMPERATURE: ${A4B_OLLAMA_TEMPERATURE:-}
+      A4B_OLLAMA_STREAM: ${A4B_OLLAMA_STREAM:-off}
+      A4B_OLLAMA_GATEWAY_RETRIES: ${A4B_OLLAMA_GATEWAY_RETRIES:-2}
+      A4B_OLLAMA_KEEP_ALIVE: ${A4B_OLLAMA_KEEP_ALIVE:-}
+      A4B_ORCHESTRATION_MODE: ${A4B_ORCHESTRATION_MODE:-off}
+      A4B_ORCHESTRATION_MODEL: ${A4B_ORCHESTRATION_MODEL:-}
+      A4B_DEFAULT_TIMEZONE: ${A4B_DEFAULT_TIMEZONE-Asia/Seoul}
+      A4B_VERIFIER_PROVIDER: ${A4B_VERIFIER_PROVIDER:-ollama}
+      A4B_VERIFIER_BASE_URL: ${A4B_VERIFIER_BASE_URL:-${A4B_DOCKER_OLLAMA_URL:-http://host.docker.internal:11434}}
+      A4B_VERIFIER_API_KEY: ${A4B_VERIFIER_API_KEY:-${A4B_LLM_API_KEY:-}}
+      A4B_VERIFIER_MODEL: ${A4B_VERIFIER_MODEL:-qwen3.5:4b}
+      # Optional model reviewer only; native workflow validation remains active.
+      A4B_VERIFIER_MODE: ${A4B_VERIFIER_MODE:-off}
+      A4B_PLANNER_MODE: ${A4B_PLANNER_MODE:-deepagent}
+      A4B_PLANNER_PROMPT: ${A4B_PLANNER_PROMPT:-v1}
+      # Catalogue delivery is independent of the DeepAgent/direct planner selection.
+      A4B_TOOL_CATALOG_MODE: ${A4B_TOOL_CATALOG_MODE:-direct}
+      # Request validation/clarification (question IDs, condition ledger, unsupported checks).
+      # Preserve main's enforced default; the root .env can explicitly turn either check off.
+      A4B_CAPABILITY_MODE: ${A4B_CAPABILITY_MODE:-enforce}
+      A4B_CONDITION_MODE: ${A4B_CONDITION_MODE:-enforce}
+      A4B_REQUIREMENT_MODE: ${A4B_REQUIREMENT_MODE:-off}
+      A4B_REQUIREMENT_GENERATION_MODE: ${A4B_REQUIREMENT_GENERATION_MODE:-baseline}
+      A4B_MAIN_TIMEOUT_S: ${A4B_MAIN_TIMEOUT_S:-180}
+      A4B_DESIGN_TIMEOUT_MS: ${A4B_DESIGN_TIMEOUT_MS:-600000}
+      A4B_PARSER_URL: ${A4B_PARSER_URL:-}
+      A4B_PARSER_API_KEY: ${A4B_PARSER_API_KEY:-}
+      A4B_PARSER_FALLBACK: ${A4B_PARSER_FALLBACK:-cpu}
+      A4B_TOOL_ADVICE_MODE: ${A4B_TOOL_ADVICE_MODE:-hint}
+      A4B_TOOL_ADVICE_BACKEND: ${A4B_TOOL_ADVICE_BACKEND:-svm56}
+      A4B_SVM_MODEL_PATH: ${A4B_DOCKER_SVM_MODEL_PATH:-/app/ml-bundle/model/recommender_char_svm_5431.joblib}
+      A4B_SVM_CATALOG_PATH: /app/ml-bundle/catalog/catalog_56.json
+      A4B_SVM_EXPECTED_MODEL_SHA256: ${A4B_SVM_EXPECTED_MODEL_SHA256:-}
+    extra_hosts:
+      # Docker Desktop provides host.docker.internal; this makes it resolve on Linux engines too.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - a4b-data:/app/data
+      - type: bind
+        source: ${A4B_ML_BUNDLE_DIR:-./runtime/ml-bundle}
+        target: /app/ml-bundle
+        read_only: true
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+  # Optional disposable PostgreSQL for storage tests only. Not started by `docker compose up`:
+  #   docker compose --profile test-db up -d postgres-test
+  #   A4B_TEST_DATABASE_URL=postgresql://postgres:a4b-test@127.0.0.1:55432/a4b_test npm run test:python
+  # Data lives in tmpfs and disappears when the container stops.
+  postgres-test:
+    profiles: ["test-db"]
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_PASSWORD: a4b-test
+      POSTGRES_DB: a4b_test
+    ports:
+      - "127.0.0.1:${A4B_TEST_DB_PORT:-55432}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d a4b_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  a4b-data:
+

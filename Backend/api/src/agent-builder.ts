@@ -1,0 +1,553 @@
+import {parseToolGapChoiceRequest,parseRedesignDecisionRequest} from './tool-gap-contract';
+import {parseRequestTimezone} from './request-timezone';
+import {agentPython,backendPath,dataDirectory} from './paths';
+import {builderNeedsGmail,builderNeedsModel,builderNeedsSlack} from './builder-model-requirements';
+import {spawn,type ChildProcessWithoutNullStreams} from 'node:child_process';
+import {extname} from 'node:path';
+import {StringDecoder} from 'node:string_decoder';
+import {existsSync,mkdirSync,appendFileSync} from 'node:fs';
+import {mkdir,writeFile,readFile} from 'node:fs/promises';
+import {convertBuilderPdf} from './builder-documents';
+import {analyzeBuilderDocument,analysisSupportsFormat,routingEnabled} from './document-analysis';
+import {parseDocumentReviewCommand,documentPreview,originalMime} from './document-review';
+import {createHash,randomBytes,randomUUID} from 'node:crypto';
+import {localModelConnection,localModelHealth,LOCAL_MODEL_ID} from './builder-local-model';
+import type {IncomingMessage,ServerResponse} from 'node:http';
+import type {Store} from './store';
+import {parseCsv} from './binary';
+import {binaryObjectPath,deleteUploadFiles,readWorkspaceFile,saveWorkspaceFile,workspaceFilesEnabled} from './workspace-files';
+import {readXlsx,extractPdfText} from './document-files';
+import {storageConfig,workerLimits} from './storage-config';
+import {createWorkerLanes,WorkerBusyError} from './worker-slots';
+import {assertTeamLibraryAccess} from './team-library-access';
+import {prepareScheduleSource,assertScheduleSourcePayload,parseScheduleSourceSelection,sourceRevision,validateScheduleSourceSelection,readScheduleSourceOriginal} from './schedule-source';
+
+export function builderReportBytes(artifact:{content:string;encoding?:string}):Buffer {
+ return Buffer.from(artifact.content,artifact.encoding==='base64'?'base64':'utf8');
+}
+
+const idPattern=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function libraryBody(value:any,keys:string[]){
+ if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(key=>!keys.includes(key)))throw new Error('자료함 요청 형식을 확인하세요.');
+ return value as Record<string,any>;
+}
+function libraryFolderId(value:unknown){
+ if(value===undefined||value===null)return null;
+ if(typeof value!=='string'||!idPattern.test(value))throw new Error('폴더 ID를 확인하세요.');
+ return value;
+}
+function libraryName(value:unknown){
+ const name=typeof value==='string'?value.normalize('NFC').trim():'';
+ if(typeof value!=='string'||/[\/\\\p{C}\u2028\u2029]/u.test(value)||!name||[...name].length>80||['.','..'].includes(name))throw new Error('폴더 이름을 한 줄로 1~80자 입력하세요. /와 \\는 사용할 수 없습니다.');
+ return name;
+}
+function libraryQuery(url:URL,keys:string[]){
+ for(const key of url.searchParams.keys())if(!keys.includes(key)||url.searchParams.getAll(key).length!==1)throw new Error('자료함 조회 조건을 확인하세요.');
+}
+const nodeEditPath=/^(?:arguments_json\.([A-Za-z_][A-Za-z0-9_]*)|execution_plan\.filters\[[0-4]\]\.(?:field|value|compare_field))$/;
+function editValue(value:unknown){
+ return value===null||typeof value==='number'&&Number.isFinite(value)||typeof value==='string'&&value.length<=200;
+}
+export function parseNodeEdit(value:unknown,content:unknown){
+ if(!value||typeof value!=='object'||Array.isArray(value)||
+    Object.keys(value).some(key=>!['request','nodeId','label','changes'].includes(key)))
+  throw new Error('노드 설정 변경 형식을 확인하세요.');
+ const edit=value as Record<string,unknown>;
+ if(typeof edit.request!=='string'||edit.request!==content||edit.request.length>4000||
+    typeof edit.nodeId!=='string'||!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$/.test(edit.nodeId)||
+    typeof edit.label!=='string'||!edit.label.trim()||edit.label.length>200||/[\r\n`]/.test(edit.label)||
+    !Array.isArray(edit.changes)||edit.changes.length<1||edit.changes.length>20)
+  throw new Error('노드 설정 변경 대상과 내용을 확인하세요.');
+ const seen=new Set<string>();
+ const changes=edit.changes.map((item:unknown)=>{
+  if(!item||typeof item!=='object'||Array.isArray(item)||
+     Object.keys(item).some(key=>!['path','oldValue','newValue'].includes(key)))
+   throw new Error('노드 설정 변경 항목을 확인하세요.');
+  const change=item as Record<string,unknown>,path=change.path;
+  if(typeof path!=='string'||!nodeEditPath.test(path)||seen.has(path)||
+     /(?:secret|token|password|credential|api.?key|authorization)/i.test(path)||
+     (path.startsWith('arguments_json.')&&['__proto__','prototype','constructor'].includes(path.slice('arguments_json.'.length)))||
+     !Object.prototype.hasOwnProperty.call(change,'oldValue')||
+     !Object.prototype.hasOwnProperty.call(change,'newValue')||
+     !editValue(change.oldValue)||!editValue(change.newValue)||
+     (path.startsWith('arguments_json.')&&(change.oldValue===null||change.newValue===null)))
+   throw new Error('노드 설정 변경 경로와 값을 확인하세요.');
+  seen.add(path);
+  return {path,old_value:change.oldValue,new_value:change.newValue};
+ });
+ return {request:edit.request,node_id:edit.nodeId,label:edit.label,changes};
+}
+type StagedUpload={original?:string;bucket?:string;directory?:string};
+async function reconcileStagedUpload(staged:StagedUpload){
+ // A worker can commit successfully before its response is lost. Never remove a registered original.
+ try{
+  if(!staged.original){await deleteUploadFiles(staged);return;}
+  const {registered}=await builderWorker({action:'original_registered',original:staged.original});
+  if(!registered)await deleteUploadFiles(staged);
+ }catch{console.warn('Failed to reconcile staged upload',staged.original);}
+}
+/** Shared by direct uploads and server-authorized team-to-personal copies. */
+export async function persistLibraryUpload(input:{fileName:string;data:string},folder_id:string|null=null,
+ source?:{team_id:string;asset_id:string;team_name:string},authorize?:()=>Promise<unknown>){
+ await builderWorker({action:'validate_destination',folder_id});
+ const staged:StagedUpload={};
+ try{
+  const parsed=await parseBuilderAsset(input,directory=>{staged.directory=directory;}),asset:Record<string,any>=parsed.asset;
+  const relative='builder-originals/'+randomBytes(32).toString('hex')+'.'+parsed.asset.format;
+  const bytes=Buffer.from(input.data,'base64');
+  staged.original=relative;
+  const bucket=await saveWorkspaceFile(relative,bytes);staged.bucket=bucket;
+  await mkdir(dataDirectory('builder-originals'),{recursive:true});await writeFile(dataDirectory(relative),bytes);
+  Object.assign(asset,{original_path:relative,original_bucket:bucket,version:1,
+   processing_status:asset.parser_status==='partial'?'partial':'ready',...(source?{copied_from_team:source}:{})});
+  // Parsing can take time; a revoked membership must not register a new copy afterwards.
+  if(authorize)await authorize();
+  return await builderWorker({action:'library_upload',...parsed,folder_id});
+ }catch(error){if(staged.original||staged.directory)await reconcileStagedUpload(staged);throw error;}
+}
+const locks=new Set<string>();
+const builderLockKey=(id:string,test=false)=>dataDirectory()+':'+(test?'test:':'')+id;
+export function builderWorkerTimeout(action:string,env:NodeJS.ProcessEnv=process.env):number {
+ const execution=['test','scheduled_run','retry_run','resume_run'].includes(action);
+ const localDesign=['message','confirm'].includes(action)&&['ollama','vllm'].includes(env.A4B_MAIN_PROVIDER||'');
+ const fallback=execution?900000:localDesign?600000:180000;
+ const configured=Number(execution?env.A4B_WORKER_TIMEOUT_MS:localDesign?env.A4B_DESIGN_TIMEOUT_MS:undefined);
+ return Number.isFinite(configured)&&configured>0&&configured<=1800000?configured:fallback;
+}
+let workerLanes:ReturnType<typeof createWorkerLanes>|null|undefined;
+/** With RDS each worker process holds connections, so processes are capped (SQLite: unlimited, as before). */
+function acquireWorkerSlot(action:string):Promise<()=>void>{
+ if(workerLanes===undefined)workerLanes=storageConfig().kind==='postgres'?createWorkerLanes(workerLimits()):null;
+ return workerLanes?workerLanes.acquire(action):Promise.resolve(()=>{});
+}
+export function resetWorkerSlots(){workerLanes=undefined;}
+class BuilderWorkerError extends Error {
+ constructor(message:string,readonly reasonCode:string){super(message);}
+}
+function generationFailureCode(error:unknown){
+ return error instanceof WorkerBusyError?'worker_busy':error instanceof BuilderWorkerError?error.reasonCode:'request_rejected';
+}
+export async function builderWorker(payload:Record<string,unknown>):Promise<any>{
+ const prepared=await prepareScheduleSource(payload,runBuilderWorker);
+ if(prepared.result!==undefined)return prepared.result;
+ payload=prepared.payload;
+ if(!['message','confirm'].includes(String(payload.action)))return runBuilderWorker(payload);
+ const generation_request_id=String(payload.generation_request_id||randomUUID());
+ // HTTP requests register before resolving model credentials; direct callers register here.
+ if(!payload.generation_request_id)await runBuilderWorker({...payload,action:'begin_generation',request_action:payload.action,generation_request_id});
+ try{return await runBuilderWorker({...payload,generation_request_id});}
+ catch(error){
+  try{await runBuilderWorker({action:'interrupt_generation',id:payload.id,generation_request_id,reason_code:generationFailureCode(error)});}
+  catch{throw new Error('생성 요청에 실패했고 이력 종료 상태도 기록하지 못했습니다. 서버와 DB 연결을 확인하세요.',{cause:error});}
+  throw error;
+ }
+}
+async function runBuilderWorker(payload:Record<string,unknown>):Promise<any>{
+ const python=agentPython();
+ if(!existsSync(python))throw new Error('Deep Agents 실행 환경이 없습니다. scripts/setup/setup-agent-demo.sh를 먼저 실행하세요.');
+ const release=await acquireWorkerSlot(String(payload.action));
+ // Recheck after waiting for a worker slot: membership may have changed while
+ // queued. Server-only reconciliation can still remove unregistered files.
+ try{if(payload.action!=='original_registered')await assertTeamLibraryAccess();await assertScheduleSourcePayload(payload);}
+ catch(error){release();throw error;}
+ const execution=['test','scheduled_run','retry_run','resume_run'].includes(String(payload.action));
+ const runId=payload.action==='test'?String(payload.run_id||randomUUID()):String(payload.id||'');
+ const executionToken=execution?randomUUID():undefined;
+ const workerPayload=execution?{...payload,execution_token:executionToken,...(payload.action==='test'?{run_id:runId}:{})}:payload;
+ return new Promise((accept,reject)=>{
+  let timingPath='';
+  if(['message','confirm','test','scheduled_run','retry_run','resume_run'].includes(String(payload.action)))
+   try{const dir=dataDirectory('builder-timing');mkdirSync(dir,{recursive:true,mode:0o700});timingPath=dataDirectory('builder-timing',randomUUID()+'.jsonl');}catch{}
+  const timing=(event:string)=>{if(timingPath)try{appendFileSync(timingPath,JSON.stringify({event,at:Date.now()/1000})+'\n',{mode:0o600});}catch{}};
+  timing('worker_start');
+  let child:ChildProcessWithoutNullStreams;
+  try{child=spawn(python,[backendPath('service/worker.py')],{stdio:['pipe','pipe','pipe'],env:{...process.env,EASYFLOW_DATA_DIR:dataDirectory(),A4B_TIMING_LOG:timingPath,LANGCHAIN_TRACING_V2:'false',LANGSMITH_TRACING:'false'}});}
+  catch(error){release();throw new BuilderWorkerError('Python 실행 환경을 시작하지 못했습니다.','worker_start_failed');}
+  const stdoutDecoder=new StringDecoder('utf8');
+  let stdout='',stdoutBytes=0,settled=false,heartbeatBusy=false;
+  let heartbeat:ReturnType<typeof setInterval>|undefined;
+  const clear=()=>{clearTimeout(timer);if(heartbeat)clearInterval(heartbeat);};
+  const fail=async(message:string,reasonCode='worker_failed')=>{
+   if(settled)return;settled=true;clear();timing(child.exitCode===null&&child.signalCode===null?'worker_interrupted':'worker_failed');child.kill('SIGKILL');
+   if(execution)await builderWorker({action:'interrupt_run',id:runId,execution_token:executionToken}).catch(()=>{});
+   reject(new BuilderWorkerError(message,reasonCode));
+  };
+  const timeout=builderWorkerTimeout(String(payload.action));
+  const timeoutMessage=execution?'실행 시간이 초과됐습니다. 실행 기록을 확인하고 실패 단계부터 재시도하세요.':'모델 설계 응답 시간이 초과됐습니다. 대화는 보존되어 있으니 서버 상태와 응답 제한 시간을 확인한 뒤 다시 시도하세요.';
+  const timer=setTimeout(()=>void fail(timeoutMessage,'worker_timeout'),timeout);
+  if(execution){
+   heartbeat=setInterval(()=>{
+    if(settled||heartbeatBusy)return;heartbeatBusy=true;
+    void builderWorker({action:'heartbeat_run',id:runId,execution_token:executionToken,...(payload.action==='scheduled_run'?{lease_token:payload.lease_token}:{})})
+     .catch(()=>void fail('실행 소유권을 갱신하지 못했습니다. 실행 기록에서 재시도하세요.')).finally(()=>{heartbeatBusy=false;});
+   },20000);heartbeat.unref();
+  }
+  // The slot is freed only when the process is gone, not when the request settles.
+  child.on('error',()=>{release();void fail('Python 실행 환경을 시작하지 못했습니다.','worker_start_failed');});
+  child.stdout.on('data',chunk=>{
+   if(settled)return;
+   const bytes=Buffer.isBuffer(chunk)?chunk:Buffer.from(chunk);stdoutBytes+=bytes.length;
+   if(stdoutBytes>12*1024*1024){void fail('에이전트 결과 크기 제한을 넘었습니다.');return;}
+   // Pipe chunks can split a Korean/emoji code point; retain incomplete UTF-8 bytes.
+   stdout+=stdoutDecoder.write(bytes);
+  });
+  child.stderr.resume();child.stdin.on('error',()=>{});
+  child.on('close',()=>{
+   release();
+   if(settled)return;
+   timing('worker_exit');
+   stdout+=stdoutDecoder.end();
+   try{const data=JSON.parse(stdout.trim());if(!data.ok){void fail(data.error||'에이전트 실행에 실패했습니다.');return;}settled=true;clear();
+    // The worker has committed the run and produced the local report before returning.
+    const report=data.result?.artifact?.content;
+    if(execution&&workspaceFilesEnabled&&data.result?.report_path&&typeof report==='string'){
+     const bytes=builderReportBytes(data.result.artifact);
+     void saveWorkspaceFile(binaryObjectPath('results',bytes),bytes).then(()=>accept(data.result),reject);
+    }else accept(data.result);}
+   catch{void fail('에이전트 응답을 읽지 못했습니다. 실행 기록과 Python 환경을 확인하세요.','worker_response_invalid');}
+  });
+  child.stdin.end(JSON.stringify({...workerPayload,directory:dataDirectory()}));
+ });
+}
+export async function parseBuilderAsset(input:any,onArtifactDirectory?:(relative:string)=>void){
+ if(typeof input?.fileName!=='string'||!input.fileName.trim()||input.fileName.length>200||/[\/\\\u0000-\u001f]/.test(input.fileName))throw new Error('파일 이름을 확인하세요.');
+ if(typeof input.data!=='string'||input.data.length>11200000||input.data.length%4!==0||!/^[A-Za-z0-9+/]*={0,2}$/.test(input.data))throw new Error('파일 데이터를 확인하세요.');
+ const bytes=Buffer.from(input.data,'base64');if(bytes.toString('base64')!==input.data)throw new Error('파일 데이터를 확인하세요.');if(!bytes.length||bytes.length>8*1024*1024)throw new Error('파일은 8MB 이하로 연결하세요.');
+ const format=extname(input.fileName).slice(1).toLowerCase();let rows:Record<string,unknown>[]=[],text='',pages:string[]=[],kind='table',documentMeta:Record<string,unknown>={};
+ const routed=routingEnabled()&&analysisSupportsFormat(format)?await analyzeBuilderDocument(bytes,format,onArtifactDirectory):undefined;
+ if(format==='csv'||format==='tsv'){
+  let decoded:string;try{decoded=new TextDecoder('utf-8',{fatal:true}).decode(bytes);}catch{decoded=new TextDecoder('euc-kr',{fatal:true}).decode(bytes);}
+  rows=parseCsv(decoded,{delimiter:format==='tsv'?'\t':','});
+ }
+ else if(format==='xlsx')rows=await readXlsx(bytes,{includeEmptyCells:true});
+ else if(format==='json'){const value=JSON.parse(bytes.toString('utf8'));if(!Array.isArray(value)||value.length>5000||value.some(r=>!r||typeof r!=='object'||Array.isArray(r)))throw new Error('JSON은 객체 행의 배열로 입력하세요.');rows=value;}
+ else if(routed||['txt','md','pdf'].includes(format)){kind='document';if(routed||format==='pdf'){const parsed=routed||await convertBuilderPdf(bytes);pages=parsed.pages;text=parsed.text;documentMeta={engine:parsed.engine,parser_version:parsed.parser_version,warnings:parsed.warnings,page_count:parsed.page_count,sections:parsed.sections,tables:parsed.tables,parser_status:parsed.parser_status,parser_metadata:parsed.parser_metadata};}else{text=new TextDecoder('utf-8',{fatal:true}).decode(bytes);pages=[text];}if(!text.trim()&&!routed)throw new Error('문서의 본문이 비어 있습니다.');if(text.length>1000000)throw new Error('문서는 1,000,000자 이내로 연결하세요.');}
+ else throw new Error('지원되는 문서·이미지 또는 CSV·XLSX·JSON 표 파일을 연결하세요.');
+ if(routed){text=routed.text;pages=routed.pages;documentMeta={engine:routed.engine,parser_version:routed.parser_version,warnings:routed.warnings,
+  page_count:routed.page_count,sections:routed.sections,tables:routed.tables,parser_status:routed.parser_status,parser_metadata:routed.parser_metadata};}
+ if(kind==='table'&&!rows.length)throw new Error('표 파일에 데이터 행이 없습니다.');
+ const columns=[...new Set(rows.flatMap(row=>Object.keys(row)))];
+ if(columns.length>200||columns.some(k=>!k.trim()||k.length>120||['__proto__','prototype','constructor'].includes(k)))throw new Error('열 이름 또는 열 수를 확인하세요. 최대 200개 열을 지원합니다.');
+ if(rows.some(r=>Object.values(r).some(v=>v!==null&&!['string','number','boolean'].includes(typeof v))))throw new Error('표의 셀은 문자열·숫자·논리값·빈 값만 지원합니다.');
+ const profile=Object.fromEntries(columns.map(k=>{const values=rows.map(r=>r[k]);const filled=values.filter(v=>v!==null&&v!==undefined&&v!=='');return [k,{types:[...new Set(filled.map(v=>typeof v))],missing:values.length-filled.length,duplicateValues:filled.length-new Set(filled.map(v=>JSON.stringify(v))).size,numericStrings:filled.filter(v=>typeof v==='string'&&v.trim()!==''&&Number.isFinite(Number(v))).length}];}));
+ return {asset:{name:input.fileName,kind,format,size_bytes:bytes.length,hash:createHash('sha256').update(bytes).digest('hex'),row_count:rows.length,columns,profile,preview:rows.slice(0,3),text,pages,
+  capabilities:[kind,...(kind==='table'&&routed?.text.trim()?['document']:[])],...documentMeta},rows};
+}
+export async function handleAgentBuilder(req:IncomingMessage,res:ServerResponse,url:URL,store:Store,readBody:(req:IncomingMessage,max?:number)=>Promise<any>,json:(res:ServerResponse,status:number,value:any)=>void,gmailAccessToken?:()=>Promise<string|undefined>,slackAccessToken?:()=>Promise<string|undefined>):Promise<boolean>{
+ if(!url.pathname.startsWith('/api/agent-builder/'))return false;
+ const action=url.pathname.slice('/api/agent-builder/'.length),method=req.method||'GET';
+ if(action==='source_original'){
+  if(method!=='GET'){res.setHeader('Allow','GET');json(res,405,{error:'지원하지 않는 요청입니다.'});return true;}
+  libraryQuery(url,['run_id','asset_id']);const runId=url.searchParams.get('run_id'),assetId=url.searchParams.get('asset_id');
+  if(!runId||!idPattern.test(runId)||!assetId||!idPattern.test(assetId))throw new Error('실행과 원본 자료 ID를 확인하세요.');
+  const {asset,bytes}=await readScheduleSourceOriginal(runId,assetId,runBuilderWorker);
+  res.writeHead(200,{'Content-Type':originalMime(String(asset.format||'')),'Content-Length':bytes.length,
+   'Content-Disposition':`inline; filename*=UTF-8''${encodeURIComponent(String(asset.name||'원본 파일'))}`,
+   'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Content-Security-Policy':'sandbox'});res.end(bytes);return true;
+ }
+ if(action==='schedule_source'){
+  res.setHeader('Cache-Control','no-store');
+  if(!['GET','POST'].includes(method)){res.setHeader('Allow','GET, POST');json(res,405,{error:'지원하지 않는 요청입니다.'});return true;}
+  libraryQuery(url,method==='GET'?['id']:[]);
+  const data:Record<string,any>=method==='GET'?{id:url.searchParams.get('id')}:libraryBody(await readBody(req,16000),['id','base_revision','selection']);
+  if(typeof data.id!=='string'||!idPattern.test(data.id))throw new Error('워크플로우 ID를 확인하세요.');
+  if(method==='GET'){json(res,200,await builderWorker({action:'schedule_source',id:data.id}));return true;}
+  if(!Object.hasOwn(data,'selection'))throw new Error('자료 연결 설정을 지정하세요.');
+  const base_revision=sourceRevision(data.base_revision),selection=parseScheduleSourceSelection(data.selection);
+  if(selection){
+   const {agent}=await builderWorker({action:'agent',id:data.id});
+   const target=agent.config.workflow?.nodes?.find((node:any)=>node.id===selection.target_node_id);
+   const targetKind=target?.settings?.operation?undefined:target?.tool==='read_table'?'table':target?.tool==='read_document'?'document':undefined;
+   if(!targetKind)throw new Error('자료를 읽을 표·문서 작업을 선택하세요.');
+   if(targetKind==='table'&&selection.mode==='fixed'&&selection.asset_ids.length!==1)throw new Error('표 읽기 작업에는 고정 파일을 하나만 선택하세요.');
+   await validateScheduleSourceSelection(selection,targetKind,runBuilderWorker);
+  }
+  const savedSelection=selection?{...selection}:null;if(savedSelection)delete savedSelection.revision;
+  json(res,200,await builderWorker({action:'schedule_source',id:data.id,base_revision,selection:savedSelection}));return true;
+ }
+ if(['library','library_upload','folders','asset_move'].includes(action)){
+  const allowed=action==='library'?['GET']:action==='folders'?['POST','PATCH','DELETE']:['POST'];
+  if(!allowed.includes(method)){res.setHeader('Allow',allowed.join(', '));json(res,405,{error:'지원하지 않는 요청입니다.'});return true;}
+  res.setHeader('Cache-Control','no-store');
+  if(action==='library'){
+   libraryQuery(url,['folder_id','before','q']);
+   const folder_id=libraryFolderId(url.searchParams.get('folder_id')),before=url.searchParams.get('before'),q=url.searchParams.get('q');
+   if(before!==null&&(!/^[1-9]\d*$/.test(before)||!Number.isSafeInteger(Number(before))))throw new Error('자료 목록 위치를 확인하세요.');
+   if(q!==null&&([...q].length>200||/[\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(q)))throw new Error('검색어를 한 줄로 200자 이하 입력하세요.');
+   json(res,200,await builderWorker({action:'library',folder_id,before:before===null?null:Number(before),...(q===null?{}:{q:q.trim()})}));return true;
+  }
+  if(action==='folders'&&method==='DELETE'){
+   libraryQuery(url,['id']);const id=url.searchParams.get('id');
+   if(!id||!idPattern.test(id))throw new Error('폴더 ID를 확인하세요.');
+   json(res,200,await builderWorker({action:'folder_delete',id}));return true;
+  }
+  libraryQuery(url,[]);
+  const data=libraryBody(await readBody(req,action==='library_upload'?12*1024*1024:4096),
+   action==='library_upload'?['fileName','data','folder_id']:action==='asset_move'?['id','folder_id']:method==='POST'?['name','parent_id']:['id','name','parent_id']);
+  if(action==='folders'){
+   if(method==='POST'){json(res,200,await builderWorker({action:'folder_create',name:libraryName(data.name),parent_id:libraryFolderId(data.parent_id)}));return true;}
+   if(typeof data.id!=='string'||!idPattern.test(data.id)||(Object.hasOwn(data,'name')?1:0)+(Object.hasOwn(data,'parent_id')?1:0)!==1)throw new Error('폴더 ID와 변경할 항목 하나를 입력하세요.');
+   json(res,200,await builderWorker({action:'folder_update',id:data.id,...(Object.hasOwn(data,'name')?{name:libraryName(data.name)}:{parent_id:libraryFolderId(data.parent_id)})}));return true;
+  }
+  const folder_id=libraryFolderId(data.folder_id);
+  if(action==='asset_move'){
+   if(typeof data.id!=='string'||!idPattern.test(data.id)||!Object.hasOwn(data,'folder_id'))throw new Error('자료 ID와 이동할 폴더를 확인하세요.');
+   json(res,200,await builderWorker({action:'asset_move',id:data.id,folder_id}));return true;
+  }
+  json(res,200,await persistLibraryUpload(data as {fileName:string;data:string},folder_id));return true;
+ }
+ if(action==='assets'&&method==='GET'){
+  const before=url.searchParams.get('before');
+  if(before!==null&&(!/^[1-9]\d*$/.test(before)||!Number.isSafeInteger(Number(before))))throw new Error('자료 목록 위치를 확인하세요.');
+  res.setHeader('Cache-Control','no-store');
+  json(res,200,await builderWorker({action,before:before===null?null:Number(before)}));return true;
+ }
+ if(action==='assets'&&method==='DELETE'||action==='asset_preview'&&method==='GET'){
+  const id=url.searchParams.get('id');
+  if(!id||!idPattern.test(id))throw new Error('자료 ID를 확인하세요.');
+  res.setHeader('Cache-Control','no-store');
+  if(method==='DELETE'){
+   const cleanup=await builderWorker({action:'prepare_asset_delete',id});
+   try{
+    await deleteUploadFiles(cleanup);
+    json(res,200,await builderWorker({action:'finish_asset_delete',id}));
+   }catch{
+    json(res,503,{error:'자료 삭제를 마치지 못했습니다. 자료함에서 삭제 재시도를 눌러주세요.',pending_delete:true});
+   }
+  }else json(res,200,await builderWorker({action,id}));
+  return true;
+ }
+ if(action==='document_review'&&['GET','POST'].includes(method)){
+  const data=method==='GET'?{id:url.searchParams.get('id')}:await readBody(req,12000);
+  if(!idPattern.test(data?.id||''))throw new Error('자료 ID를 확인하세요.');
+  const payload=method==='GET'?{action:'document_review',id:data.id}:{action:'document_review',id:data.id,command:parseDocumentReviewCommand(data)};
+  json(res,200,await builderWorker(payload));return true;
+ }
+ if(action==='document_preview'&&method==='GET'){
+  const id=url.searchParams.get('id');if(!id||!idPattern.test(id))throw new Error('자료 ID를 확인하세요.');
+  const {asset}=await builderWorker({action:'asset',id});
+  const preview=await documentPreview(asset,url.searchParams.get('blockId'),url.searchParams.get('converted'));
+  res.writeHead(200,{'Content-Type':preview.mime,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; frame-ancestors 'self'"});res.end(preview.bytes);return true;
+ }
+ if(action==='connection'&&method==='GET'){json(res,200,{connection:localModelConnection(),...(url.searchParams.get('profile')==='1'?{}:{health:await localModelHealth()})});return true;}
+ if(action==='report'&&method==='GET'){
+  const id=url.searchParams.get('id');if(!id||!idPattern.test(id))throw new Error('실행 ID를 확인하세요.');
+  const {run}=await builderWorker({action:'run',id});if(!/^reports\/[0-9a-f-]{36}\.(csv|json|md|txt|docx|xlsx|pdf|png|zip|html|eml|bin)$/.test(run.report_path||''))throw new Error('저장된 보고서가 없습니다.');
+  const legacy=()=>readFile(dataDirectory(run.report_path)).catch(()=>{throw new Error('서버 보고서 파일을 찾지 못했습니다. 실행 기록을 확인하세요.');});
+  const report=run.artifact?.content;
+  let content:Buffer;
+  if(workspaceFilesEnabled&&typeof report==='string'){
+   const bytes=builderReportBytes(run.artifact);
+   content=await readWorkspaceFile(binaryObjectPath('results',bytes),()=>bytes);
+  }else content=await legacy();
+  res.writeHead(200,{'Content-Type':run.artifact?.mime||'application/octet-stream','Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(run.artifact?.name||'report.csv')}`,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(content);return true;
+ }
+ if(['approved_replies','review_report'].includes(action)&&method==='GET'){
+  const id=url.searchParams.get('id');if(!id||!idPattern.test(id))throw new Error('항목 ID를 확인하세요.');
+  let artifact;
+  if(action==='approved_replies')artifact=await builderWorker({action,id});
+  else {const {run}=await builderWorker({action:'run',id});if(!run.reviews?.length)throw new Error('검수 보고서가 없습니다.');artifact={name:'검수_보고서_'+id+'.json',mime:'application/json; charset=utf-8',content:JSON.stringify({id:run.id,agent_version:run.agent_version,source_version:run.source_version,created_at:run.created_at,status:run.status,reviews:run.reviews},null,2)};}
+  res.writeHead(200,{'Content-Type':artifact.mime,'Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(artifact.name)}`,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(artifact.content);return true;
+ }
+ if(action==='original'&&method==='GET'){const id=url.searchParams.get('id');if(!id||!idPattern.test(id))throw new Error('자료 ID를 확인하세요.');const {asset}=await builderWorker({action:'asset',id});if(!/^builder-originals\/[a-f0-9]{64}\.[a-z0-9]+$/.test(asset.original_path||''))throw new Error('원본 파일이 없는 이전 자료입니다. 다시 연결하세요.');const content=await readWorkspaceFile(asset.original_path,()=>readFile(dataDirectory(asset.original_path)));res.writeHead(200,{'Content-Type':originalMime(asset.format),'Content-Disposition':`inline; filename*=UTF-8''${encodeURIComponent(asset.name)}`,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(content);return true;}
+ if(['agents','nodes'].includes(action)&&method==='DELETE'){
+  libraryQuery(url,['id','version']);const id=url.searchParams.get('id'),version=Number(url.searchParams.get('version'));
+  if(!id||!idPattern.test(id)||!Number.isSafeInteger(version)||version<1)throw new Error('삭제할 작업 ID와 버전을 확인하세요.');
+  res.setHeader('Cache-Control','no-store');
+  json(res,200,await builderWorker({action:'delete_entry',kind:action==='agents'?'agent':'node',id,base_version:version}));return true;
+ }
+ if(action==='nodes'&&method==='GET'){json(res,200,await builderWorker({action:'nodes'}));return true;}
+ if(action==='nodes'&&method==='POST'){
+  const data=await readBody(req,50000);
+  if(!data?.spec||typeof data.spec!=='object'||Array.isArray(data.spec)||data.id!==undefined&&(typeof data.id!=='string'||!idPattern.test(data.id))||data.baseVersion!==undefined&&(!Number.isInteger(data.baseVersion)||data.baseVersion<0))throw new Error('노드 설정과 버전을 확인하세요.');
+  json(res,200,await builderWorker({action:'save_node',spec:data.spec,id:data.id,base_version:data.baseVersion??0}));return true;
+ }
+ if(action==='studio'&&method==='GET'){json(res,200,await builderWorker({action:'studio'}));return true;}
+ if(action==='catalog'&&method==='GET'){json(res,200,await builderWorker({action:'catalog'}));return true;}
+ if(action==='history'&&method==='GET'){res.setHeader('Cache-Control','no-store');const id=url.searchParams.get('id');if(id!==null&&!idPattern.test(id))throw new Error('워크플로우 ID를 확인하세요.');const page=Number(url.searchParams.get('page')??'1');if(!Number.isInteger(page)||page<1||page>10000)throw new Error('실행 기록 페이지를 확인하세요.');json(res,200,await builderWorker({action:'history',page,...(id?{id}:{})}));return true;}
+ if(action==='agents'&&method==='GET'){json(res,200,await builderWorker({action:'agents',...(url.searchParams.get('summary')==='1'?{summary:true}:{})}));return true;}
+ if(action==='schedules'){
+  res.setHeader('Cache-Control','no-store');
+  if(method!=='GET'){res.setHeader('Allow','GET');json(res,405,{error:'지원하지 않는 요청입니다.'});return true;}
+  json(res,200,await builderWorker({action:'schedules',...(url.searchParams.get('include_agents')==='1'?{include_agents:true}:{})}));return true;
+ }
+ if(action==='workflow_folders'&&method==='POST'){
+  const data=await readBody(req,50000);
+  if(!data||!['create','rename','delete','move'].includes(data.operation)||!Number.isSafeInteger(data.revision)||data.revision<0||data.folder_id!=null&&(typeof data.folder_id!=='string'||!idPattern.test(data.folder_id)))throw new Error('폴더 작업과 버전을 확인하세요.');
+  json(res,200,await builderWorker({action:'workflow_folders',operation:data.operation,revision:data.revision,folder_id:data.folder_id??null,name:data.name,agent_ids:data.agent_ids}));return true;
+ }
+ if(action==='rename_agent'&&method==='POST'){
+  const data=await readBody(req,4096);
+  if(typeof data?.id!=='string'||!idPattern.test(data.id)||!Number.isSafeInteger(data.version)||data.version<1||typeof data.name!=='string')throw new Error('워크플로우 ID, 버전, 이름을 확인해주세요.');
+  json(res,200,await builderWorker({action:'rename_agent',id:data.id,base_version:data.version,name:data.name}));return true;
+ }
+ if(action==='tool_gap_replan_decision'&&method==='POST'){
+  const data=parseRedesignDecisionRequest(await readBody(req,10000));
+  const lockKey=builderLockKey(data.id);
+  if(locks.has(lockKey)){json(res,409,{error:'이 대화의 이전 요청을 처리 중입니다.'});return true;}
+  locks.add(lockKey);
+  try{res.setHeader('Cache-Control','no-store');json(res,200,await builderWorker({action:'tool_gap_replan_decide',id:data.id,
+   revision:data.revision,request_id:data.requestId,proposal_id:data.proposalId,decision:data.decision}));}
+  finally{locks.delete(lockKey);}return true;
+ }
+ if(action==='tool_gap_choice'&&method==='POST'){
+  const data=parseToolGapChoiceRequest(await readBody(req,10000));
+  const lockKey=builderLockKey(data.id);
+  if(locks.has(lockKey)){json(res,409,{error:'이 대화의 이전 요청을 처리 중입니다. 완료 후 다시 시도하세요.'});return true;}
+  locks.add(lockKey);
+  try{res.setHeader('Cache-Control','no-store');json(res,200,await builderWorker({action:'tool_gap_choice',id:data.id,
+   revision:data.revision,request_id:data.requestId,gap_id:data.gapId,state_fingerprint:data.stateFingerprint,choice:data.choice}));}
+  finally{locks.delete(lockKey);}
+  return true;
+ }
+ if(action==='tool_gap'&&method==='GET'){
+  const id=url.searchParams.get('id'),raw=url.searchParams.get('revision');
+  if(!id||!idPattern.test(id)||!raw||!/^\d+$/.test(raw)||!Number.isSafeInteger(Number(raw)))throw new Error('대화 ID와 버전을 확인하세요.');
+  res.setHeader('Cache-Control','no-store');
+  json(res,200,await builderWorker({action:'tool_gap',id,revision:Number(raw)}));return true;
+ }
+ const data=method==='GET'?{id:url.searchParams.get('id')}:await readBody(req,['upload','run_upload','source_upload'].includes(action)?12*1024*1024:100000);
+ if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('요청 형식을 확인하세요.');
+ const workerAction=action==='sessions'&&method==='POST'?'new_session':action;
+ if(!['new_session','session','generation_history','recover_generation','agent','upload','attach_asset','message','confirm','test','run_upload','resume_run','retry_run','review_decision','run','source_upload','schedule','schedule_configure','schedule_remove','schedule_test','schedule_cancel'].includes(workerAction)||(['session','generation_history','agent','run'].includes(workerAction)?method!=='GET':method!=='POST')){json(res,405,{error:'지원하지 않는 요청입니다.'});return true;}
+ if(workerAction!=='new_session'&&!idPattern.test(data.id||''))throw new Error('항목 ID를 확인하세요.');
+ const lockKey=['session','generation_history','agent','run'].includes(workerAction)?undefined:builderLockKey(data.id,workerAction==='test');
+ if(lockKey&&locks.has(lockKey)){json(res,409,{error:'이 대화의 이전 요청을 처리 중입니다. 완료 후 다시 시도하세요.'});return true;}
+ if(lockKey)locks.add(lockKey);
+ let stagedUpload:StagedUpload|undefined;
+ let generationRequestId:string|undefined;
+ try{
+  let payload:any={action:workerAction,id:data.id};
+  if(workerAction==='new_session'){
+   if(typeof data.model!=='string'||!data.model.trim()||data.model.length>120||!/^[-\w./:]+$/.test(data.model))throw new Error('모델 이름을 확인하세요.');
+   if(process.env.A4B_REQUIRE_LOCAL_MODEL==='1'&&data.credentialId!==LOCAL_MODEL_ID)throw new Error('Qwen 연결로 새 워크플로우를 만들어주세요.');
+   const local=localModelConnection();const credential=data.credentialId===LOCAL_MODEL_ID&&local?{...local.credential,data:{}}:store.getCredential(data.credentialId);if(credential.provider!=='openai')throw new Error('OpenAI 연결 계정을 선택하세요.');
+   if(data.agentId&&!idPattern.test(data.agentId))throw new Error('에이전트 ID를 확인하세요.');
+   if(data.nodeRefs!==undefined&&(!Array.isArray(data.nodeRefs)||data.nodeRefs.length>10||new Set(data.nodeRefs).size!==data.nodeRefs.length||data.nodeRefs.some((r:unknown)=>typeof r!=='string'||!/^[a-f0-9-]{36}:[1-9][0-9]{0,5}$/.test(r))))throw new Error('선택한 노드 버전을 확인하세요.');
+   if(data.executionMode!==undefined&&!['manual','scheduled'].includes(data.executionMode))throw new Error('실행 방식은 직접 실행 또는 예약 실행으로 선택하세요.');
+   payload={action:workerAction,model:credential.id===LOCAL_MODEL_ID?local!.model:data.model,credential_id:credential.id,agent_id:data.agentId,node_refs:data.nodeRefs,execution_mode:data.executionMode};
+  }
+  if(['upload','attach_asset','message','confirm','recover_generation'].includes(workerAction)){if(!Number.isInteger(data.revision)||data.revision<0)throw new Error('대화 버전을 확인하세요.');payload.revision=data.revision;}
+  if(workerAction==='recover_generation'){
+   if(typeof data.generationRequestId!=='string'||!idPattern.test(data.generationRequestId))throw new Error('생성 요청 ID를 확인하세요.');
+   payload.generation_request_id=data.generationRequestId;
+  }
+  if(workerAction==='confirm'&&data.includeSchedule!==undefined){
+   if(typeof data.includeSchedule!=='boolean')throw new Error('예약을 함께 저장할지 선택해주세요.');
+   payload.include_schedule=data.includeSchedule;
+  }
+  if(['message','confirm'].includes(workerAction)){
+   if(typeof store.gmailConnected==='function')payload.gmail_connected=store.gmailConnected();
+   if(typeof store.listCredentials==='function')payload.slack_connected=store.listCredentials().some(c=>c.provider==='slack'&&(c.service==='slack'||!c.service));
+  }
+  if(workerAction==='attach_asset'){
+   if(typeof data.assetId!=='string'||!idPattern.test(data.assetId))throw new Error('연결할 자료 ID를 확인하세요.');
+   payload.asset_id=data.assetId;
+  }
+  if(workerAction==='test'){
+   const content=data.content===undefined?'':data.content;
+   if(typeof content!=='string'||content.length>4000)throw new Error('실행 요청은 4,000자 이하의 텍스트로 입력하세요.');
+   payload.content=content.trim()?content:'';
+   if(data.useSchedule!==undefined){
+    if(typeof data.useSchedule!=='boolean')throw new Error('예약 자료 실행 여부를 확인하세요.');
+    payload.use_schedule=data.useSchedule;
+   }
+  }else if(['message','resume_run'].includes(workerAction)){
+   if(typeof data.content!=='string'||!data.content.trim()||data.content.length>4000)throw new Error('설명은 1~4,000자로 입력하세요.');payload.content=data.content;
+  }
+  if(workerAction==='message'&&data.questionId!==undefined){
+   if(typeof data.questionId!=='string'||!/^[a-f0-9]{24}$/.test(data.questionId))throw new Error('확인 질문 ID를 확인하세요.');
+   payload.question_id=data.questionId;
+  }
+  if(workerAction==='message'&&data.answers!==undefined){
+   if(data.questionId!==undefined||!Array.isArray(data.answers)||data.answers.length<1||data.answers.length>10)throw new Error('질문별 답변을 확인하세요.');
+   const seen=new Set<string>();
+   payload.question_answers=data.answers.map((answer:any)=>{
+    if(!answer||typeof answer!=='object'||Array.isArray(answer)||Object.keys(answer).some(key=>!['questionId','value','custom','skip'].includes(key))||typeof answer.questionId!=='string'||!/^[a-f0-9]{24}$/.test(answer.questionId)||seen.has(answer.questionId))throw new Error('현재 질문의 답변을 확인하세요.');
+    seen.add(answer.questionId);
+    if(answer.custom!==undefined&&typeof answer.custom!=='boolean')throw new Error('직접 입력 여부를 확인하세요.');
+    if(answer.skip!==undefined&&typeof answer.skip!=='boolean')throw new Error('선택사항 건너뛰기 여부를 확인하세요.');
+    const value=answer.value;
+    if(!(answer.skip===true&&value===null||typeof value==='string'&&!!value.trim()&&value.length<=4000||typeof value==='number'&&Number.isFinite(value)||Array.isArray(value)&&value.length>0&&value.length<=40&&value.every(part=>typeof part==='string'&&!!part.trim()&&part.length<=2000)))throw new Error('선택하거나 입력한 답변을 확인하세요.');
+    return {question_id:answer.questionId,value,...(answer.custom!==undefined?{custom:answer.custom}:{}),...(answer.skip?{skip:true}:{})};
+   });
+  }
+  if(workerAction==='message'&&data.nodeEdit!==undefined){
+   if(data.questionId!==undefined||data.answers!==undefined)throw new Error('노드 설정 변경과 확인 질문 답변을 함께 보낼 수 없습니다.');
+   payload.node_edit=parseNodeEdit(data.nodeEdit,data.content);
+  }
+  if(workerAction==='message'){
+   const timezone=parseRequestTimezone(data.userTimezone);
+   if(timezone!==undefined)payload.user_timezone=timezone;
+  }
+  if(workerAction==='schedule_test'||workerAction==='schedule'&&data.active===true){
+   const current=await builderWorker({action:'agent',id:data.id});
+   if(builderNeedsGmail(current.agent.config,current.agent.workflow_dependencies)&&!await gmailAccessToken?.())
+    throw new Error('예약 실행에 사용할 Gmail 계정을 먼저 연결해주세요.');
+   if(builderNeedsSlack(current.agent.config,current.agent.workflow_dependencies)&&!await slackAccessToken?.())
+    throw new Error('예약 실행에 사용할 Slack 계정을 먼저 연결해주세요.');
+  }
+  if(['message','confirm','test','resume_run','retry_run'].includes(workerAction)){
+   if(['message','confirm'].includes(workerAction)){
+    if(data.generationRequestId!==undefined&&(typeof data.generationRequestId!=='string'||!idPattern.test(data.generationRequestId)))throw new Error('생성 요청 ID를 확인하세요.');
+    payload.generation_request_id=data.generationRequestId||randomUUID();
+    await builderWorker({...payload,action:'begin_generation',request_action:workerAction});
+    generationRequestId=payload.generation_request_id;
+   }
+   const current=await builderWorker({action:workerAction==='test'?'agent':['resume_run','retry_run'].includes(workerAction)?'run':'session',id:data.id});
+   if(workerAction==='retry_run'&&(current.run?.error_type==='SlackDeliveryUnknown'||
+    current.run?.error_type==='InterruptedExecution'&&builderNeedsSlack(current.run.config_snapshot,current.run.workflow_dependencies)))
+    throw new Error('Slack 메시지가 전송됐을 수 있어요. 채널을 확인한 뒤 필요하면 새 실행을 시작해주세요.');
+   if(workerAction==='test'&&payload.use_schedule&&!current.schedule)throw new Error('예약 설정을 먼저 저장하세요.');
+   if(workerAction==='test'&&!payload.content&&(payload.use_schedule?current.schedule_request_required:current.request_required))throw new Error('이 워크플로우에 필요한 실행 요청을 입력하세요.');
+   const config=workerAction==='test'?current.agent.config:['resume_run','retry_run'].includes(workerAction)?current.run.config_snapshot:null;
+   const dependencies=workerAction==='test'?current.agent.workflow_dependencies:current.run?.workflow_dependencies;
+   const needsModel=builderNeedsModel(config,dependencies);
+   if(needsModel){
+    const credentialId=workerAction==='test'?current.agent.credential_id:['resume_run','retry_run'].includes(workerAction)?current.run.credential_id:current.credential_id;
+    if(process.env.A4B_REQUIRE_LOCAL_MODEL==='1'&&credentialId!==LOCAL_MODEL_ID)throw new Error('이 작업은 이전 모델 연결로 저장됐습니다. Qwen으로 다시 만들어주세요.');
+    const local=localModelConnection();const credential=credentialId===LOCAL_MODEL_ID&&local?{...local.credential,data:{apiKey:'local-not-a-secret',token:''}}:store.getCredential(credentialId);
+    if(credential.provider!=='openai')throw new Error('모델 연결 계정을 확인하세요.');
+    payload.api_key=credential.data.apiKey||credential.data.token;
+   }
+   if(builderNeedsGmail(config,dependencies))payload.gmail_access_token=await gmailAccessToken?.();
+   if(builderNeedsSlack(config,dependencies)){
+    const token=await slackAccessToken?.();
+    if(!token)throw new Error('Slack 계정을 먼저 연결해주세요.');
+    payload.slack_access_token=token;
+   }
+  }
+  if(['upload','run_upload','source_upload'].includes(workerAction)){
+   Object.assign(payload,await parseBuilderAsset(data));
+   // Independent keys let a new copy be uploaded while an older copy is being deleted.
+   const relative='builder-originals/'+randomBytes(32).toString('hex')+'.'+payload.asset.format;
+   const bytes=Buffer.from(data.data,'base64');
+   stagedUpload={original:relative,directory:payload.asset.parser_metadata?.analysis_artifact_directory};
+   payload.asset.original_bucket=await saveWorkspaceFile(relative,bytes);
+   await mkdir(dataDirectory('builder-originals'),{recursive:true});await writeFile(dataDirectory(relative),bytes);
+   payload.asset.original_path=relative;payload.asset.version=1;
+   payload.asset.processing_status=payload.asset.parser_status==='partial'?'partial':'ready';
+  }
+  if(workerAction==='test'&&data.replyDraft!==undefined){if(typeof data.replyDraft!=='string'||data.replyDraft.length>12000)throw new Error('검수 초안은 12,000자 이하로 입력하세요.');payload.reply_draft=data.replyDraft;}
+  if(workerAction==='review_decision'){
+   if(typeof data.reviewId!=='string'||!/^[-\w]+:\d+$/.test(data.reviewId)||data.reviewId.length>60)throw new Error('검수 항목 ID를 확인하세요.');
+   if(!['approve','reject'].includes(data.decision)||typeof data.editedReply!=='string'||data.editedReply.length>12000||data.decision==='approve'&&!data.editedReply.trim())throw new Error('결정과 승인할 응대문을 확인하세요.');
+   Object.assign(payload,{review_id:data.reviewId,decision:data.decision,edited_reply:data.editedReply});
+  }
+  if(workerAction==='schedule_cancel'){if(!idPattern.test(data.jobId||''))throw new Error('시험 예약 ID를 확인하세요.');payload.job_id=data.jobId;}
+  if(workerAction==='schedule'){if(typeof data.active!=='boolean')throw new Error('예약 활성 상태를 확인하세요.');payload.active=data.active;}
+  if(workerAction==='schedule_configure'){
+   if(!data.spec||typeof data.spec!=='object'||Array.isArray(data.spec))throw new Error('예약 일정을 확인하세요.');
+   payload.spec=data.spec;
+  }
+  if(workerAction==='test'&&data.fileIds!==undefined){if(!Array.isArray(data.fileIds)||data.fileIds.length>10||data.fileIds.some((id:unknown)=>typeof id!=='string'||!idPattern.test(id)))throw new Error('실행 자료 ID를 확인하세요.');payload.file_ids=data.fileIds;}
+  json(res,200,await builderWorker(payload));return true;
+ }catch(error){
+  if(generationRequestId){
+   try{await builderWorker({action:'interrupt_generation',id:data.id,generation_request_id:generationRequestId,reason_code:generationFailureCode(error)});}
+   catch{throw new Error('생성 요청에 실패했고 이력 종료 상태도 기록하지 못했습니다. 서버와 DB 연결을 확인하세요.',{cause:error});}
+  }
+  if(stagedUpload)await reconcileStagedUpload(stagedUpload);
+  throw error;
+ }finally{if(lockKey)locks.delete(lockKey);}
+}

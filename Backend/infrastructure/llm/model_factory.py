@@ -1,0 +1,58 @@
+"""One explicit model connection for design, execution, resume and retries."""
+import os
+
+
+def ChatOpenAI(**options):
+    # Imported on first use: langchain_openai/openai add ~0.6 s to every worker job,
+    # including jobs that never call a model.
+    from langchain_openai import ChatOpenAI as chat_model
+    return chat_model(**options)
+
+
+# The web server sends this placeholder (or no key) when the local model connection is selected.
+LOCAL_MODEL_API_KEY = 'local-not-a-secret'
+
+
+def create_chat_model(api_key, model, **limits):
+    provider = os.getenv('A4B_MAIN_PROVIDER', 'openai')
+    if provider not in ('openai', 'ollama', 'vllm'):
+        raise ValueError('A4B_MAIN_PROVIDER는 openai/ollama/vllm이어야 합니다.')
+    if os.getenv('A4B_REQUIRE_LOCAL_MODEL') == '1' and (provider not in ('ollama', 'vllm') or api_key not in (None, '', LOCAL_MODEL_API_KEY)):
+        raise ValueError('Qwen 서버 연결만 사용할 수 있습니다. OpenAI 계정 호출은 차단됐습니다.')
+    options = dict(model=model, api_key=api_key, **limits)
+    # Only the explicit local connection goes to the local server; a selected OpenAI account
+    # (real key) always talks to OpenAI, whatever the server-wide provider is.
+    if provider != 'openai' and api_key in (None, '', LOCAL_MODEL_API_KEY):
+        base_url = os.getenv('A4B_MAIN_BASE_URL')
+        if not base_url:
+            raise ValueError('로컬 모델의 A4B_MAIN_BASE_URL이 필요합니다.')
+        timeout=float(os.getenv('A4B_MAIN_TIMEOUT_S','180'))
+        if not 1<=timeout<=600:raise ValueError('A4B_MAIN_TIMEOUT_S는 1~600초로 설정하세요.')
+        options['timeout']=timeout
+        # Respect the caller's bounded transport retry policy. Design extractors
+        # pass zero; run execution asks for one. Never retry an entire workflow.
+        retries = limits.get('max_retries', 0)
+        if type(retries) is not int or not 0 <= retries <= 2:
+            raise ValueError('모델 연결 max_retries(재시도 횟수)는 0~2여야 합니다.')
+        options['max_retries'] = retries
+        options.update(base_url=base_url, api_key=os.getenv('A4B_MAIN_API_KEY') or LOCAL_MODEL_API_KEY,
+                       default_headers={'User-Agent': 'A4B/0.1'})
+        if provider == 'vllm':
+            from infrastructure.llm.qwen_chat_model import QwenChatOpenAI
+            options.update(temperature=0.7, top_p=0.8, streaming=True, stream_usage=True, extra_body={
+                'top_k': 20, 'min_p': 0,
+                'chat_template_kwargs': {'enable_thinking': False},
+                'structured_outputs': {'whitespace_pattern': '[ ]?'},
+            })
+            return QwenChatOpenAI(**options)
+        # /v1 uses reasoning_effort; think is retained for compatible Ollama versions.
+        from infrastructure.llm.model_aliases import resolve_ollama_model
+        options['model'] = resolve_ollama_model(model)
+        from infrastructure.llm.ollama_settings import temperature_setting, output_limit, bounded_output_limit, resident_options
+        if os.getenv('A4B_OLLAMA_NUM_PREDICT', '').strip():
+            options['max_tokens']=bounded_output_limit(options.get('max_tokens') or output_limit())
+        options.update(temperature=temperature_setting(options.get('temperature',0.7)), top_p=0.8, reasoning_effort='none', extra_body={'think': False, **resident_options(options['model'])},
+                       streaming=True, stream_usage=True)
+        from infrastructure.llm.ollama_chat_model import OllamaChatOpenAI
+        return OllamaChatOpenAI(**options)
+    return ChatOpenAI(**options)

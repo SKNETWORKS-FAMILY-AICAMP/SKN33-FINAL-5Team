@@ -1,0 +1,18 @@
+.workflow-folders{margin:20px 0;display:grid;gap:12px;min-width:0}
+.workflow-folder-form{display:grid;gap:16px}.workflow-folder-form label{display:grid;gap:8px}
+.workflow-folder-form input,.workflow-folder-form select{width:100%;min-height:44px;padding:10px;border:1px solid var(--a4b-border,#cbd5e1);border-radius:6px}
+.workflow-folder-form>div{display:flex;gap:8px;justify-content:flex-end}
+.workflow-card-select{display:inline-flex;align-items:center;gap:8px;font-size:13px}
+.workflow-card-select input,.workflow-select-all input{width:16px;height:16px;margin:0;accent-color:#244e73;flex:none}
+.workflow-select-all{display:flex;align-items:center;gap:8px;margin:12px 0}
+
+.workflow-folder-toolbar{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:12px}
+.workflow-folder-move{justify-self:start}
+
+.workflow-folder-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.workflow-view-filters{display:flex;gap:4px;width:max-content;padding:4px;border-radius:8px;background:var(--a4b-neutral-soft)}
+.workflow-view-filters .as-button{min-height:32px;padding:4px 12px;border-color:transparent;background:transparent;color:var(--a4b-muted)}
+.workflow-view-filters .as-button[aria-pressed=true]{border-color:var(--a4b-border);background:var(--a4b-surface);color:var(--a4b-action);font-weight:650}
+.workflow-folder-label{align-self:center;padding-right:4px;color:var(--a4b-muted);font-size:12px;font-weight:600}
+
+.workflow-selection-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px;border:1px solid var(--a4b-border);border-radius:8px;background:var(--a4b-neutral-soft)}

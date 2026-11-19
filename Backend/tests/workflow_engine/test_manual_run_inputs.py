@@ -1,0 +1,266 @@
+"""Manual runs must prompt for the input the saved workflow actually consumes."""
+import pytest
+
+from service.worker import handle
+from tests.workflow_engine.test_workflow import bind, edge, node, saved
+
+
+def test_saved_legacy_table_plan_advertises_its_required_table(tmp_path):
+    from agent_builder.conditions.input_requirements import execution_requirements
+    from infrastructure.persistence.ids import uid
+    from infrastructure.persistence.storage import Storage
+    store = Storage(tmp_path)
+    try:
+        plan = {'tool_ids': ['read_table', 'write_result'], 'execution_plan': {'output_format': 'csv'}}
+        assert execution_requirements(plan, store)[0]['ready'] is False
+        asset = store.add_asset({'id':uid(), 'name':'orders.csv', 'kind':'table', 'columns':['id']}, [{'id':1}])
+        plan['document_ids'] = [asset['id']]
+        requirement, = execution_requirements(plan, store)
+        assert requirement['ready'] and requirement['file_ids'] == [asset['id']]
+    finally:
+        store.close()
+
+
+def test_deleted_legacy_sample_keeps_detail_open_and_accepts_a_new_table(tmp_path):
+    from types import SimpleNamespace
+    from infrastructure.persistence.ids import uid
+    from infrastructure.persistence.storage import Storage
+    from service.handlers import library, uploads
+    from agent_builder.conditions.input_requirements import execution_requirements
+    from tests.design.test_builder import draft, initial
+
+    store = Storage(tmp_path)
+    try:
+        original = store.add_asset({'id':uid(), 'name':'old.csv', 'kind':'table', 'columns':['id']}, [{'id':1}])
+        config = {**draft(), 'workflow':None, 'document_ids':[original['id']],
+                  'tool_ids':['read_table','write_result'], 'execution_plan':{'output_format':'csv'}}
+        identifier = store.save_agent({**initial(), 'draft':config, 'confirmed':True})
+        deletion = SimpleNamespace(storage=store, data={'id':original['id']})
+        uploads.prepare_delete(deletion)
+        uploads.finish_delete(deletion)
+        detail = library.agent(SimpleNamespace(storage=store, data={'id':identifier}))
+        assert detail['resources'] == [] and detail['request_required'] is False
+        requirement, = detail['input_requirements']
+        assert not requirement['ready'] and '삭제' in requirement['issues'][0]
+        replacement = store.add_asset({'id':uid(), 'name':'new.csv', 'kind':'table', 'columns':['id']}, [{'id':2}])
+        requirement, = execution_requirements(config, store, [replacement['id']])
+        assert requirement['ready'] and requirement['file_ids'] == [replacement['id']]
+    finally:
+        store.close()
+
+
+def test_deletion_cannot_leave_a_dangling_legacy_run_file(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from infrastructure.persistence.ids import uid
+    from infrastructure.persistence.storage import Storage
+    from service.handlers import uploads
+    from tests.design.test_builder import draft, initial
+    from workflow_engine.legacy_runtime import test_agent
+
+    store = Storage(tmp_path)
+    deleting = Storage(tmp_path)
+    try:
+        agent_id = store.save_agent({**initial(), 'draft': draft(), 'confirmed': True})
+        upload = store.add_asset({'id':uid(), 'name':'new.csv', 'format':'csv', 'kind':'table',
+                                  'columns':['id']}, [{'id':1}])
+        read = store.asset
+        def delete_after_read(identifier):
+            parsed = read(identifier)
+            delete = SimpleNamespace(storage=deleting, data={'id':identifier})
+            uploads.prepare_delete(delete)
+            uploads.finish_delete(delete)
+            return parsed
+        monkeypatch.setattr(store, 'asset', delete_after_read)
+        monkeypatch.setattr('workflow_engine.legacy_runtime.create_chat_model',
+                            lambda **_: pytest.fail('A deleted input must be rejected before model execution'))
+        with pytest.raises(ValueError, match='자료가 삭제'):
+            test_agent(store, agent_id, '', '', file_ids=[upload['id']])
+        assert store.tests(agent_id) == []
+    finally:
+        deleting.close()
+        store.close()
+
+
+def test_missing_document_and_wrong_replacement_are_rejected_before_execution(tmp_path):
+    workflow = {'entry': 'read', 'nodes': [node('read', 'read_document')], 'edges': []}
+    store, identifier, _ = saved(tmp_path, workflow)
+    store.close()
+    job = {'directory': str(tmp_path), 'id': identifier}
+    table = handle({**job, 'action': 'run_upload', 'asset': {'name': 'table.csv', 'kind': 'table',
+                    'format': 'csv', 'columns': ['amount']}, 'rows': [{'amount': 10}]})['asset']
+    for files in ([], [table['id']]):
+        with pytest.raises(ValueError, match='문서|자료'):
+            handle({**job, 'action': 'test', 'content': '', 'file_ids': files})
+    assert handle({**job, 'action': 'agent'})['tests'] == []
+
+
+def test_search_without_a_saved_query_requires_real_text_even_with_file(tmp_path):
+    workflow = {'entry': 'read', 'nodes': [
+        node('read', 'read_document'),
+        node('search', 'search_document', [bind('documents', 'read', 'documents')]),
+    ], 'edges': [edge('read', 'search')]}
+    store, identifier, doc = saved(tmp_path, workflow)
+    store.close()
+    job = {'directory': str(tmp_path), 'id': identifier}
+    assert handle({**job, 'action': 'agent'})['request_required'] is True
+    for content in ({}, {'content': '   '}):
+        with pytest.raises(ValueError, match='실행 요청'):
+            handle({**job, 'action': 'test', 'file_ids': [doc['id']], **content})
+    assert handle({**job, 'action': 'agent'})['tests'] == []
+
+
+def test_a_paused_run_requires_a_real_answer_and_can_then_resume(tmp_path):
+    workflow = {'entry': 'read', 'nodes': [
+        node('read', 'read_document'),
+        node('ask', 'ask_user', question='처리를 승인할까요?'),
+    ], 'edges': [edge('read', 'ask')]}
+    store, identifier, doc = saved(tmp_path, workflow)
+    store.close()
+    job = {'directory': str(tmp_path), 'id': identifier, 'action': 'test'}
+    paused = handle({**job, 'content': '', 'file_ids': [doc['id']]})
+    assert paused['status'] == 'needs_input', paused.get('error')
+    resume = {**job, 'id': paused['id'], 'action': 'resume_run'}
+    with pytest.raises(ValueError, match='답변|입력'):
+        handle({**resume, 'content': '   '})
+    assert handle({**resume, 'action': 'run'})['run']['status'] == 'needs_input'
+    finished = handle({**resume, 'content': '승인합니다.'})
+    assert finished['status'] == 'succeeded'
+    assert finished['outputs']['ask']['answer'] == '승인합니다.'
+
+
+def test_run_now_uses_saved_schedule_instructions_without_fabricating_a_customer_message(tmp_path, monkeypatch):
+    from contracts.models import AgentDraft
+    from infrastructure.persistence.ids import uid
+    from infrastructure.persistence.storage import Storage
+    from tests.design.test_builder import draft, initial
+
+    instructions = '연결한 매출표에서 오늘의 총액을 요약해 보고서로 저장하세요.'
+    store = Storage(tmp_path)
+    try:
+        source = {'id': uid(), 'name': 'sales.csv', 'kind': 'table', 'format': 'csv', 'columns': ['매출']}
+        store.add_asset(source, [{'매출': 15000}])
+        guide = {'id': uid(), 'name': 'guide.txt', 'kind': 'document', 'format': 'txt', 'text': '매출 보고서 지침'}
+        store.add_asset(guide, [])
+        nodes = [node('read', 'read_table', file_ids=[source['id']]),
+                 node('sales', 'write_result', [bind('table', 'read', 'table')], format='csv'),
+                 node('guide', 'read_document', file_ids=[guide['id']]),
+                 node('summarize', 'compose_answer', [bind('documents', 'guide', 'documents')]),
+                 node('report', 'export_result', [bind('text', 'summarize', 'text')], format='markdown')]
+        workflow = {'entry': 'read', 'nodes': nodes, 'edges': [edge(a['id'], b['id']) for a, b in zip(nodes, nodes[1:])]}
+        config = {**draft(), 'instructions': instructions, 'tool_ids': [n['tool'] for n in nodes],
+                  'workflow': workflow, 'document_ids': [source['id'], guide['id']], 'report_destination': 'reports',
+                  'schedule': {'frequency': 'daily', 'timezone': 'Asia/Seoul', 'hour': 9, 'minute': 0, 'weekday': None}}
+        session = {**initial(), 'draft': AgentDraft.model_validate(config).model_dump(), 'confirmed': True}
+        identifier = store.save_agent(session)
+    finally:
+        store.close()
+
+    def summarize(node, state, storage, config, llm):
+        assert state['request'] == instructions
+        assert state['customer_message'] == ''
+        assert not state['messages']
+        assert state['outputs']['read']['table']['rows'] == [{'매출': 15000}]
+        return {'text': '총액 15,000원'}
+
+    monkeypatch.setattr('workflow_engine.runner.create_chat_model', lambda **_: object())
+    monkeypatch.setattr('workflow_engine.executors.document.compose_answer.execute', summarize)
+    job = {'id': identifier, 'directory': str(tmp_path)}
+    detail = handle({**job, 'action': 'agent'})
+    assert detail['request_required'] is False and detail['source']['asset_id'] == source['id']
+    run = handle({**job, 'action': 'test'})
+    assert run['status'] == 'succeeded', run.get('error')
+    assert run['trigger'] == 'manual' and run['source_version'] == detail['source']['version']
+    persisted = handle({**job, 'action': 'run', 'id': run['id']})['run']
+    assert persisted['request'] == ''
+    assert not [message for message in persisted['messages'] if message['role'] == 'user']
+    assert '총액 15,000원' in persisted['artifact']['content']
+
+
+def test_saved_analysis_instructions_do_not_require_retyping():
+    from agent_builder.conditions.input_requirements import execution_request_required
+    workflow = {'entry': 'read', 'nodes': [
+        node('read', 'read_document'),
+        node('summary', 'compose_answer', [bind('documents', 'read', 'documents')]),
+    ], 'edges': [edge('read', 'summary')]}
+    config = {'workflow': workflow, 'instructions': '문서의 주요 내용을 요약하세요.', 'request_input_mode':'saved_instructions'}
+    assert not execution_request_required(config)
+    config['instructions'] = ''
+    assert execution_request_required(config)
+    workflow['nodes'][1]['settings']['instructions'] = '문서의 주요 내용을 요약하세요.'
+    assert not execution_request_required(config)
+    workflow['nodes'][1] = node('review', 'reply_review', [bind('documents', 'read', 'documents')])
+    assert execution_request_required(config)
+
+
+def test_saved_analysis_runs_without_new_text_and_receives_saved_instructions(tmp_path, monkeypatch):
+    from workflow_engine import runner
+    workflow = {'entry': 'read', 'nodes': [
+        node('read', 'read_document'),
+        node('summary', 'compose_answer', [bind('documents', 'read', 'documents')],
+             instructions='주요 내용을 요약하세요.'),
+    ], 'edges': [edge('read', 'summary')]}
+    store, identifier, doc = saved(tmp_path, workflow, request_input_mode='saved_instructions')
+    expected = store.agent(identifier)['config']['instructions']
+    original = runner.execute_node
+    prompts = []
+    def execute(current, state, *args, **kwargs):
+        if current['id'] == 'summary':
+            prompts.append(state['request'])
+            return {'text': '제목은 테스트입니다.', 'evidence': []}
+        return original(current, state, *args, **kwargs)
+    from service.handlers import runs
+    def run_saved(*args, **kwargs):
+        return runner.run_workflow(*args, **kwargs, executor=execute, llm=object())
+    monkeypatch.setattr(runs, 'run_workflow', run_saved)
+    store.close()
+    job = dict(directory=str(tmp_path), id=identifier)
+    assert handle({**job, 'action':'agent'})['request_required'] is False
+    run = handle({**job, 'action':'test', 'content':'', 'file_ids':[doc['id']]})
+    assert run['status'] == 'succeeded', run.get('error')
+    assert prompts == [expected]
+    assert run['answer'] == '제목은 테스트입니다.'
+
+
+@pytest.mark.parametrize('mode',[None,'required'])
+def test_document_question_requires_real_input_even_with_saved_instructions(tmp_path,monkeypatch,mode):
+    from workflow_engine import runner
+    from service.handlers import runs
+    workflow={'entry':'read','nodes':[
+        node('read','read_document'),
+        node('answer','compose_answer',[bind('documents','read','documents')],
+             instructions='이번 실행에서 사용자가 입력한 질문에 답하세요.')],
+        'edges':[edge('read','answer')]}
+    store,identifier,doc=saved(tmp_path,workflow,request_input_mode=mode,
+        instructions='첨부 문서를 참고하여 사용자가 실행할 때 입력하는 질문에 답하세요.')
+    store.close()
+    observed=[];original=runner.execute_node
+    def execute(current,state,*args,**kwargs):
+        if current['id']=='answer':
+            observed.append((state['request'],state['customer_message']))
+            return {'text':'질문에 대한 답변','evidence':[]}
+        return original(current,state,*args,**kwargs)
+    monkeypatch.setattr(runs,'run_workflow',lambda *args,**kwargs:runner.run_workflow(*args,**kwargs,executor=execute,llm=object()))
+    job=dict(directory=str(tmp_path),id=identifier)
+    assert handle({**job,'action':'agent'})['request_required'] is True
+    with pytest.raises(ValueError,match='요청|질문|입력'):
+        handle({**job,'action':'test','content':'','file_ids':[doc['id']]})
+    assert not observed
+    result=handle({**job,'action':'test','content':'문서의 제목은 무엇인가요?','file_ids':[doc['id']]})
+    assert result['status']=='succeeded',result.get('error')
+    assert observed==[('문서의 제목은 무엇인가요?','문서의 제목은 무엇인가요?')]
+
+
+@pytest.mark.parametrize('mode',[None,'required','saved_instructions'])
+def test_parent_schedule_prompt_only_satisfies_explicit_fixed_child(mode):
+    from agent_builder.conditions.input_requirements import execution_request_required
+    child={'workflow':{'entry':'read','nodes':[node('read','read_document'),
+            node('answer','compose_answer',[bind('documents','read','documents')],instructions='사용자 질문에 답하세요.')],
+            'edges':[edge('read','answer')]},
+           'instructions':'문서 처리 지시문','request_input_mode':mode}
+    call=node('child','saved_workflow')
+    config={'workflow':{'entry':'child','nodes':[call],'edges':[]},'instructions':'매일 실행하세요.',
+            'schedule':{'frequency':'daily'}}
+    dependencies={'child':{'config':child}}
+    assert execution_request_required(config,dependencies) is (mode!='saved_instructions')
+    call['bindings']=[bind('text','previous','text')]
+    assert not execution_request_required(config,dependencies)

@@ -15,7 +15,7 @@ import {Switch} from '@/components/ui/switch';
 import {Select,SelectTrigger,SelectValue,SelectContent,SelectItem} from '@/components/ui/select';
 import {Plus,Trash2,Play,ChevronDown,Braces,ArrowRight,RefreshCw,Pin,PinOff} from 'lucide-react';
 import {toast} from 'sonner';
-import type {CredentialPublic} from '@/server/contracts';
+import type {CredentialPublic} from '@/lib/api-contracts';
 import {type Flow,type FlowNode,type NodeRun,type Execution,type Json,clone,nodeInfo,nodePorts,catalog} from '@/lib/workflow';
 type EditableField={key:string;label:string;type:'text'|'textarea'|'number'|'select'|'json';options?:{value:string;label:string}[];placeholder?:string;help?:string;showWhen?:Record<string,string[]>;advanced?:boolean};
 type EditorInfo=NonNullable<ReturnType<typeof nodeInfo>>&{fields?:EditableField[];credentialProviders?:string[];credentialService?:string};

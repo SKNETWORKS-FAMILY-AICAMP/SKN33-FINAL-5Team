@@ -1,0 +1,64 @@
+"""Transport compatibility and actionable connection errors; no business policy."""
+from infrastructure.llm.ollama_chat_model import OllamaChatOpenAI
+from infrastructure.llm.errors import public_error
+from agent_builder.design.nodes.conversation import make_conversation
+from tests.design.test_deep_agent_conversation import state, draft
+import pytest
+
+
+def test_ollama_final_payload_omits_empty_tool_controls():
+    model=OllamaChatOpenAI(model='qwen3:8b',api_key='test',base_url='http://127.0.0.1:1/v1')
+    payload=model._get_request_payload('test',tools=[],tool_choice='auto',parallel_tool_calls=False,
+        response_format={'type':'json_object'})
+    assert not {'tools','tool_choice','parallel_tool_calls'} & payload.keys()
+    assert payload['response_format']=={'type':'json_object'}
+
+
+
+def test_remote_connection_errors_are_actionable_and_keys_are_hidden(monkeypatch):
+    monkeypatch.setenv('A4B_MAIN_PROVIDER','ollama')
+    monkeypatch.setenv('A4B_LLM_API_KEY','dedicated-test-key')
+    import httpx
+    from langchain_openai.chat_models.base import OpenAIConnectionError,OpenAITimeoutError
+    request=httpx.Request('POST','https://example.invalid/v1/chat/completions')
+    error=OpenAIConnectionError(request=request)
+    assert 'RunPod가 실행 중인지' in public_error(error)
+    assert 'example.invalid' not in public_error(error)
+    timeout=OpenAITimeoutError(request=request)
+    assert '시간이 초과' in public_error(timeout)
+    assert 'dedicated-test-key' not in public_error(ValueError('bad dedicated-test-key'))
+    from openai import InternalServerError
+    unavailable=InternalServerError('private upstream body',response=httpx.Response(503,request=request),body=None)
+    assert 'RunPod 실행 상태' in public_error(unavailable)
+    assert 'private upstream body' not in public_error(unavailable)
+
+
+
+
+def test_unsupported_settings_are_not_exposed_as_raw_provider_errors():
+    from langchain.agents.structured_output import StructuredOutputValidationError
+    from langchain_core.messages import AIMessage
+    error=StructuredOutputValidationError('AgentDraft',ValueError('private provider body'),AIMessage(content='{}'))
+    result=public_error(error)
+    assert '구조화 응답' in result
+    assert 'private provider body' not in result
+
+
+
+def test_model_output_length_error_explains_the_output_limit():
+    from openai import LengthFinishReasonError
+    from openai.types.chat import ChatCompletion
+
+    completion = ChatCompletion.model_construct(choices=[], usage=None)
+    error = LengthFinishReasonError(completion=completion)
+    assert public_error(error) == '모델 응답이 출력 길이 제한에 도달해 중단됐습니다. 출력 분량을 줄여 다시 시도해주세요.'
+
+
+def test_ollama_wire_preserves_the_requested_output_budget_without_mutating_input():
+    from infrastructure.llm.ollama_chat_model import compatible_schema_payload
+    payload = {'model': 'qwen3.5:4b', 'max_completion_tokens': 9000}
+    assert compatible_schema_payload(payload) == {'model': 'qwen3.5:4b', 'max_tokens': 9000}
+    assert payload == {'model': 'qwen3.5:4b', 'max_completion_tokens': 9000}
+    model = OllamaChatOpenAI(model='qwen3.5:4b', api_key='test', base_url='http://127.0.0.1:1/v1', max_tokens=9000)
+    wire = model._get_request_payload('test')
+    assert wire['max_tokens'] == 9000 and 'max_completion_tokens' not in wire

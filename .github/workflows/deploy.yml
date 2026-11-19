@@ -1,0 +1,380 @@
+name: Deploy A4B to EC2
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - .github/workflows/deploy.yml
+      - scripts/deploy/deploy-a4b-ec2.sh
+      - scripts/deploy/a4b-ssm-command.sh
+      - scripts/deploy/a4b-ssm-release.sh
+      - scripts/deploy/a4b-frontend-release.py
+      - scripts/deploy/a4b-deploy-targets.py
+      - scripts/deploy/deploy-a4b-frontend.sh
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 배포 또는 복귀
+        type: choice
+        default: deploy
+        options: [deploy, restore]
+      target:
+        description: 배포할 영역 (복귀 시 무시)
+        type: choice
+        default: auto
+        options: [auto, all, frontend, backend]
+      branch:
+        description: 배포할 브랜치 (복귀 시 무시)
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a4b-ec2-production
+  cancel-in-progress: false
+
+jobs:
+  resolve-image:
+    if: github.ref == 'refs/heads/main' && inputs.operation != 'restore'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      cached: ${{ steps.source.outputs.cached }}
+      target: ${{ steps.source.outputs.target }}
+      tag: ${{ steps.source.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.A4B_DEPLOY_ROLE_ARN }}
+          aws-region: ap-northeast-2
+      - name: Resolve the commit and check for a verified image
+        id: source
+        shell: bash
+        env:
+          DEPLOY_BRANCH: ${{ inputs.branch }}
+          DEPLOY_TARGET: ${{ inputs.target || 'auto' }}
+          INSTANCE_ID: ${{ vars.A4B_EC2_INSTANCE_ID }}
+          ECR_REPOSITORY: ${{ vars.A4B_ECR_REPOSITORY }}
+          AWS_REGION: ap-northeast-2
+        run: |
+          set -euo pipefail
+          commit="$GITHUB_SHA"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$DEPLOY_BRANCH" != main ]]; then
+            git check-ref-format "refs/heads/$DEPLOY_BRANCH"
+            commit=$(git rev-parse --verify "refs/remotes/origin/$DEPLOY_BRANCH^{commit}")
+          fi
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          target=$DEPLOY_TARGET
+          if [[ "$target" == auto ]]; then
+            live=$(bash scripts/deploy/a4b-ssm-command.sh 'set -eu; app=a4b-jhd-aws; docker exec "$app" grep -oE "a4b-release=[0-9a-f]{40}" /app/Frontend/dist-app/index.html | cut -d= -f2 || true; docker inspect -f "{{.Config.Image}}" "$app"')
+            backend=$(tail -n 1 <<< "$live" | sed -nE 's/.*:(verified-|backend-)?([0-9a-f]{40})(-[0-9]+-[0-9]+)?$/\2/p')
+            frontend=$(head -n 1 <<< "$live" | sed -nE '/^[0-9a-f]{40}$/p')
+            target=$(python3 scripts/deploy/a4b-deploy-targets.py "$commit" "$frontend" "$backend")
+          fi
+          case "$target" in
+            none) echo 'target=none' >> "$GITHUB_OUTPUT"; exit 0 ;;
+            all) prefix=verified ;;
+            frontend|backend) prefix=$target ;;
+            *) exit 1 ;;
+          esac
+          tag="$prefix-$commit"
+          response=$(aws ecr batch-get-image --repository-name "${ECR_REPOSITORY#*/}" \
+            --image-ids "imageTag=$tag" --output json)
+          if jq -e '.images[0].imageId.imageDigest | test("^sha256:[0-9a-f]{64}$")' <<< "$response" >/dev/null 2>&1; then
+            cached=true
+          elif jq -e '.failures | length == 1 and .[0].failureCode == "ImageNotFound"' <<< "$response" >/dev/null; then
+            cached=false
+          else
+            echo 'Unable to determine if the verified image exists' >&2
+            exit 1
+          fi
+          printf 'commit=%s\ncached=%s\ntarget=%s\ntag=%s\n' "$commit" "$cached" "$target" "$tag" >> "$GITHUB_OUTPUT"
+          echo "Commit $commit, verified image available: $cached"
+
+  verify:
+    needs: resolve-image
+    if: needs.resolve-image.outputs.cached == 'false'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.2-pg16
+        env:
+          POSTGRES_PASSWORD: a4b-test
+          POSTGRES_DB: a4b_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d a4b_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-image.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-python@v5
+        if: needs.resolve-image.outputs.target != 'frontend'
+        with:
+          python-version: '3.11'
+      - run: npm ci
+      - name: Set up Python workers for integration tests
+        if: needs.resolve-image.outputs.target != 'frontend'
+        run: |
+          setup=scripts/setup
+          # A manually selected branch may still use the original layout.
+          if [[ ! -f "$setup/setup-agent-demo.sh" ]]; then setup=Backend/scripts; fi
+          bash "$setup/setup-agent-demo.sh"
+          bash "$setup/setup-document-analysis.sh"
+      - name: Verify the bundled SVM and deployment guards
+        if: needs.resolve-image.outputs.target != 'frontend'
+        working-directory: Backend
+        run: |
+          .venv-agent/bin/python -m pip install -r requirements/ml-svm56.txt
+          .venv-agent/bin/python -m ml.svm56.bundle_cli check --probe
+          .venv-agent/bin/python -m pytest -q tests/ml/svm56 tests/deployment tests/design/test_direct_svm_advice.py
+      - run: npm run check
+        if: needs.resolve-image.outputs.target != 'frontend'
+      - run: npm test
+        if: needs.resolve-image.outputs.target != 'frontend'
+      - name: Test Ollama configuration, transport and output recovery
+        if: needs.resolve-image.outputs.target != 'frontend'
+        working-directory: Backend
+        run: |
+          # The selected deployment branch may predate the Ollama deployment settings.
+          if [[ ! -f tests/infrastructure/test_ollama_deployment.py ]]; then
+            echo 'Ollama deployment tests are absent on this branch; skipping this check.'
+            exit 0
+          fi
+          .venv-agent/bin/python -m pip install -r requirements/local-integration.txt
+          tests=(tests/infrastructure/test_ollama_deployment.py tests/design/test_ollama_planning.py tests/design/test_deep_agent_conversation.py tests/design/test_direct_conversation.py)
+          if [[ -f tests/infrastructure/test_model_migration.py ]]; then
+            tests+=(tests/infrastructure/test_model_migration.py)
+          fi
+          if [[ -f tests/design/test_runtime_file_planning.py ]]; then
+            tests+=(tests/design/test_runtime_file_planning.py)
+          fi
+          if [[ -f tests/design/test_qwen35_handoff.py ]]; then
+            tests+=(tests/design/test_qwen35_handoff.py)
+          fi
+          for path in tests/design/test_request_execution_contracts.py tests/verification/test_context_payload.py \
+                      tests/design/test_fill_missing_value_types.py tests/design/test_runtime_file_questions.py \
+                      tests/design/test_explicit_keep_policy.py tests/design/test_explicit_output_columns.py \
+                      tests/design/test_deferred_reader_schema.py tests/design/test_final_table_criteria.py \
+                      tests/design/test_human_review_records.py tests/design/test_bounded_output_columns.py \
+                      tests/design/test_pending_preview_contract.py tests/design/test_design_failure_guidance.py \
+                      tests/design/test_saved_requirement_failure_diagnostics.py tests/design/test_multiple_output_scope.py \
+                      tests/design/test_requirement_clarification.py tests/design/test_requirement_error_presentation.py \
+                      tests/design/test_failed_design_edits.py tests/design/test_beta_feedback.py \
+                      tests/design/test_failure_recovery.py tests/design/test_model_failure_classification.py \
+                      tests/design/test_manual_execution_questions.py tests/design/test_question_language.py \
+                      tests/design/test_pending_question_followups.py tests/design/test_node_popup_edits.py \
+                      tests/design/test_node_edit_copy.py tests/design/test_node_edit_descriptions.py \
+                      tests/design/test_node_edit_public_flow.py tests/design/test_node_edit_dependencies.py; do
+            if [[ -f "$path" ]]; then tests+=("$path"); fi
+          done
+          .venv-agent/bin/python -m pytest -q "${tests[@]}"
+      - name: Test recurring schedules, Gmail summaries and library sources
+        if: needs.resolve-image.outputs.target != 'frontend' && hashFiles('Backend/tests/workflow_engine/test_library_schedule_sources.py') != ''
+        working-directory: Backend
+        run: |
+          .venv-agent/bin/python -m pytest -q \
+            tests/workflow_engine/test_library_schedule_sources.py \
+            tests/workflow_engine/test_folder_table_batch.py \
+            tests/workflow_engine/test_folder_report_summary.py \
+            tests/workflow_engine/test_recurrence.py \
+            tests/workflow_engine/test_gmail_scheduling.py \
+            tests/workflow_engine/test_schedule_listing.py \
+            tests/workflow_engine/test_gmail_batch_read.py \
+            tests/workflow_engine/test_gmail_external_bodies.py \
+            tests/workflow_engine/test_public_gmail_runs.py \
+            tests/workflow_engine/test_gmail_summary_batches.py \
+            tests/capabilities/test_gmail_schedule_design.py \
+            tests/capabilities/test_gmail_hourly_unread_design.py \
+            tests/capabilities/test_gmail_summary.py \
+            tests/capabilities/test_native_schedule.py \
+            tests/conditions/test_schedule_literals.py \
+            tests/conditions/test_extended_schedule_literals.py \
+            tests/conditions/test_condition_readiness.py \
+            tests/conditions/test_pr28_review.py \
+            tests/design/test_attachment_precheck.py \
+            tests/design/test_attachment_deferral.py \
+            tests/design/test_node_completeness.py \
+            tests/design/test_service_connection_context.py \
+            tests/design/test_completion.py \
+            tests/infrastructure/test_asset_library.py \
+            tests/infrastructure/test_team_asset_library.py
+      - name: Test receipt workflows and saved run results
+        if: needs.resolve-image.outputs.target != 'frontend' && hashFiles('Backend/tests/design/test_receipt_questions.py') != ''
+        working-directory: Backend
+        run: |
+          tests=(tests/design/test_receipt_questions.py tests/conditions/test_reported_dialogues.py
+                 tests/conditions/test_clarification_choices.py tests/design/test_compound_filter_pipeline.py
+                 tests/design/test_filter_edit_sequences.py tests/design/test_text_filter_dialogue.py)
+          for suite in test_document_rows_template test_document_row_integrity test_document_row_coverage_review \
+                       test_document_native_table_review test_document_preview_review; do
+            path="tests/design/${suite}.py"
+            if [[ -f "$path" ]]; then tests+=("$path"); fi
+          done
+          if [[ -f tests/design/test_generation_history.py ]]; then tests+=(tests/design/test_generation_history.py); fi
+          if [[ -f tests/documents/test_file_inspection.py ]]; then tests+=(tests/documents/test_file_inspection.py); fi
+          for suite in test_receipt_fields test_receipt_items test_manual_run_inputs test_run_answer; do
+            path="tests/workflow_engine/${suite}.py"
+            if [[ -f "$path" ]]; then tests+=("$path"); fi
+          done
+          .venv-agent/bin/python -m pytest -q "${tests[@]}"
+      - name: Test document parser routing and OCR coverage
+        if: needs.resolve-image.outputs.target != 'frontend' && hashFiles('Backend/tests/documents/analysis/test_pipeline.py') != ''
+        working-directory: Backend
+        run: |
+          .venv-document-analysis/bin/python -m unittest discover -s tests/documents/analysis -p test_pipeline.py
+          if [[ -f tests/documents/analysis/test_remote_docling.py ]]; then
+            .venv-agent/bin/python -m pytest -q tests/documents/analysis/test_remote_pdf.py tests/documents/analysis/test_remote_docling.py
+          fi
+      - name: Test business-data storage on PostgreSQL
+        if: needs.resolve-image.outputs.target != 'frontend'
+        env:
+          A4B_TEST_DATABASE_URL: postgresql://postgres:a4b-test@127.0.0.1:55432/a4b_test
+        run: |
+          # A manually selected branch may not have the PostgreSQL store yet.
+          if [[ ! -f Backend/tests/infrastructure/test_storage_backends.py ]]; then exit 0; fi
+          if [[ -f Backend/infrastructure/persistence/business_records.py ]]; then
+            db_container=${{ job.services.postgres.id }}
+            for schema_file in infrastructure/db/prerequisites.sql infrastructure/db/schema.sql; do
+              docker exec -i "$db_container" psql -Xq -v ON_ERROR_STOP=1 -U postgres -d a4b_test < "$schema_file"
+            done
+            export A4B_TEST_BUSINESS_SCHEMA=1
+          fi
+          (cd Backend && .venv-agent/bin/python -m pytest tests/infrastructure/test_storage_backends.py -q)
+          node --import tsx --test Backend/api/tests/storage-config.test.ts
+      - name: Check and test frontend
+        if: needs.resolve-image.outputs.target == 'frontend'
+        run: |
+          npx tsc -p Frontend --noEmit --incremental false
+          node --import tsx --test "Frontend/tests/*.test.ts"
+
+  publish-image:
+    needs: [resolve-image, verify]
+    if: github.ref == 'refs/heads/main' && needs.resolve-image.outputs.cached == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: image-publish
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ECR_REPOSITORY: ${{ vars.A4B_ECR_REPOSITORY }}
+      IMAGE_TAG: ${{ needs.resolve-image.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-image.outputs.commit }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.A4B_IMAGE_PUBLISH_ROLE_ARN }}
+          aws-region: ap-northeast-2
+      - name: Authenticate to ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$ECR_REPOSITORY" =~ ^[0-9]{12}\.dkr\.ecr\.ap-northeast-2\.amazonaws\.com/[a-z0-9][a-z0-9._/-]*$ ]]
+          [[ "$IMAGE_TAG" =~ ^(verified|backend|frontend)-[0-9a-f]{40}$ ]]
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REPOSITORY%%/*}"
+      - name: Build the tested commit and push directly to ECR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Manually selected branches can still use the original root Dockerfile.
+          file: ${{ hashFiles('infrastructure/docker/Dockerfile') != '' && 'infrastructure/docker/Dockerfile' || 'Dockerfile' }}
+          target: ${{ needs.resolve-image.outputs.target == 'all' && 'standalone' || needs.resolve-image.outputs.target }}
+          build-args: A4B_FRONTEND_COMMIT=${{ needs.resolve-image.outputs.commit }}
+          push: true
+          provenance: false
+          tags: ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          cache-from: |
+            type=gha,scope=a4b-monolith
+            type=gha,scope=a4b-frontend
+          cache-to: type=gha,scope=${{ needs.resolve-image.outputs.target == 'frontend' && 'a4b-frontend' || 'a4b-monolith' }},mode=max,ignore-error=true
+
+  deploy:
+    if: >-
+      ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.resolve-image.result == 'success' &&
+          (needs.resolve-image.outputs.cached == 'true' || needs.publish-image.result == 'success') }}
+    needs: [resolve-image, publish-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ap-northeast-2
+      ECR_REPOSITORY: ${{ vars.A4B_ECR_REPOSITORY }}
+      INSTANCE_ID: ${{ vars.A4B_EC2_INSTANCE_ID }}
+      PUBLIC_URL: ${{ vars.A4B_PUBLIC_URL }}
+      IMAGE_TAG: ${{ needs.resolve-image.outputs.tag }}
+    steps:
+      - name: Check out the deployment script from main
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: deployment
+          persist-credentials: false
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.A4B_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy over AWS Systems Manager
+        shell: bash
+        env:
+          DEPLOY_BRANCH: ${{ inputs.branch || 'main' }}
+        run: |
+          set -euo pipefail
+          mode=production
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$DEPLOY_BRANCH" != main ]]; then
+            mode=test
+          fi
+          [[ "$ECR_REPOSITORY" =~ ^[0-9]{12}\.dkr\.ecr\.ap-northeast-2\.amazonaws\.com/[a-z0-9][a-z0-9._/-]*$ ]]
+          [[ "$IMAGE_TAG" =~ ^(verified|backend|frontend)-[0-9a-f]{40}$ ]]
+          bash deployment/scripts/deploy/a4b-ssm-release.sh "$ECR_REPOSITORY:$IMAGE_TAG" "$PUBLIC_URL" "$mode"
+
+  restore:
+    if: github.ref == 'refs/heads/main' && inputs.operation == 'restore'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ap-northeast-2
+      INSTANCE_ID: ${{ vars.A4B_EC2_INSTANCE_ID }}
+      PUBLIC_URL: ${{ vars.A4B_PUBLIC_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.A4B_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Restore the pre-test release
+        run: bash scripts/deploy/a4b-ssm-release.sh restore "$PUBLIC_URL"
